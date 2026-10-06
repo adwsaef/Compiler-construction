@@ -1,0 +1,25 @@
+[project]
+name = "mrj-support"
+version = "0.1.0"
+description = "Support code for the MRJ compilers course: the x86 AST and its interpreter"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat top-level modules, not a package: the compilers say "import x86_ast",
+# and so does the interpreter.  One module object for everybody -- were the
+# interpreter to reach x86_ast under a different name, its classes would not be
+# the compiler's classes and every "case Instr(...)" would quietly fall through.
+[tool.hatch.build.targets.wheel]
+include = ["x86_ast.py", "ast_utils.py", "graph.py", "cif.py", "cfun.py", "x86_interp.py"]
+
+[tool.mypy]
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = 'ast_utils'
+ignore_errors = true

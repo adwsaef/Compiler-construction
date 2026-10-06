@@ -1,0 +1,13 @@
+[project]
+name = "lqua"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+
+dependencies = [
+    "mrj-support",
+]
+
+[tool.uv.sources]
+mrj-support = { path = "../support", editable = true }
