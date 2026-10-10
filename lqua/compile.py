@@ -3,7 +3,7 @@
 import ast
 import argparse
 from ast import (Constant, expr, stmt, Module, Name)
-from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref)
+from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg)
 from x86_interp import checkpoint, add_arguments
 import os
 
@@ -151,14 +151,32 @@ class Compiler:
     ############################################################################
     # Patch Instructions
     ############################################################################
-
     def patch_instr(self, i: instr) -> list[instr]:
-        # YOUR CODE HERE
-        pass        
+        match i:
+            case Instr("movq", [Immediate(value), destination]) \
+                    if value >= 2**31 or value < -2**31:
+                return [
+                    Instr("movq", [Immediate(value), Reg("rax")]),
+                    Instr("movq", [Reg("rax"), destination]),
+                ]
+
+            case Instr(operation, [source, destination]) \
+                    if is_memory_arg(source) and is_memory_arg(destination):
+                return [
+                    Instr("movq", [source, Reg("rax")]),
+                    Instr(operation, [Reg("rax"), destination]),
+                ]
+
+            case _:
+                return [i]
 
     def patch_instructions(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        instructions: list[instr] = []
+        for i in p.body:
+            match i:
+                case instr():
+                    instructions.extend(self.patch_instr(i))
+        return X86Program(instructions)     
 
     ############################################################################
     # Prelude & Conclusion
@@ -184,8 +202,10 @@ def main():
     checkpoint(args, "select_instructions", instruction_list)
     assigned_homes = compiler.assign_homes(instruction_list)
     checkpoint(args, "assign_homes", assigned_homes)
+    patched_instructions = compiler.patch_instructions(assigned_homes)
+    checkpoint(args, "patch_instructions", patched_instructions)
 
-    print(assigned_homes)
+    print(patched_instructions)
 
 if __name__ == "__main__":
     main()
