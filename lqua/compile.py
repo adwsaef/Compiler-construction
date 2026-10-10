@@ -3,7 +3,7 @@
 import ast
 import argparse
 from ast import (Constant, expr, stmt, Module, Name)
-from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg)
+from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref)
 from x86_interp import checkpoint, add_arguments
 import os
 
@@ -115,17 +115,38 @@ class Compiler:
     ############################################################################
 
     def assign_homes_arg(self, a: arg, home: dict[Variable, arg]) -> arg:
-        # YOUR CODE HERE
-        pass        
+        match a:
+            case Variable():
+                return home[a]
+            case _:
+                return a
 
     def assign_homes_instr(self, i: instr,
                            home: dict[Variable, arg]) -> instr:
-        # YOUR CODE HERE
-        pass        
+        match i:
+            case Instr(name, args):
+                return Instr(name, [self.assign_homes_arg(a, home) for a in args])
+            case _:
+                return i
 
     def assign_homes(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        home: dict[Variable, arg] = {}
+        for i in p.body:
+            match i:
+                case Instr(_, args):
+                    for a in args:
+                        match a:
+                            case Variable():
+                                if a not in home:
+                                    home[a] = Deref("rbp", -8 * (len(home) + 1))
+
+        instructions: list[instr] = []
+        for i in p.body:
+            match i:
+                case instr():
+                    instructions.append(self.assign_homes_instr(i, home))
+
+        return X86Program(instructions)
 
     ############################################################################
     # Patch Instructions
@@ -161,8 +182,10 @@ def main():
 
     instruction_list = compiler.select_instructions(module)
     checkpoint(args, "select_instructions", instruction_list)
+    assigned_homes = compiler.assign_homes(instruction_list)
+    checkpoint(args, "assign_homes", assigned_homes)
 
-    print(instruction_list)
+    print(assigned_homes)
 
 if __name__ == "__main__":
     main()
