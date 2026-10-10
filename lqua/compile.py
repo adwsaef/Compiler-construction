@@ -4,7 +4,7 @@ import ast
 import argparse
 from ast import (Constant, expr, stmt, Module, Name)
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg)
-from x86_interp import checkpoint, add_arguments
+from x86_interp import checkpoint, add_arguments, interp_x86
 import os
 
 Binding = tuple[Name, expr]
@@ -183,8 +183,44 @@ class Compiler:
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        stack_space = 0
+        for i in p.body:
+            match i:
+                case Instr(_, args):
+                    for a in args:
+                        match a:
+                            case Deref("rbp", offset) if offset < 0:
+                                stack_space = max(stack_space, -offset)
+
+        prologue = [
+            Instr("pushq", [Reg("rbp")]),
+            Instr("movq", [Reg("rsp"), Reg("rbp")]),
+            Instr("subq", [Immediate(stack_space), Reg("rsp")]),
+        ]
+        conclusion = [
+            Instr("addq", [Immediate(stack_space), Reg("rsp")]),
+            Instr("popq", [Reg("rbp")]),
+            Instr("retq", []),
+        ]
+
+        instructions: list[instr] = []
+        for instruction in prologue:
+            instructions.append(instruction)
+
+        for instruction in p.body:
+            match instruction:
+                case instr():
+                    instructions.append(instruction)
+                case _:
+                    raise TypeError(
+                        "prelude_and_conclusion expects a flat instruction list"
+                    )
+
+        for instruction in conclusion:
+            instructions.append(instruction)
+
+        return X86Program(instructions)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -205,7 +241,15 @@ def main():
     patched_instructions = compiler.patch_instructions(assigned_homes)
     checkpoint(args, "patch_instructions", patched_instructions)
 
-    print(patched_instructions)
+    added_prelude_conclusion = compiler.prelude_and_conclusion(patched_instructions)
+    checkpoint(args, "prelude_and_conclusion", added_prelude_conclusion)
+
+    if args.interp:
+        interp_x86(added_prelude_conclusion)
+        return
+
+    with open(args.output, "w") as output_file:
+        output_file.write(str(added_prelude_conclusion))
 
 if __name__ == "__main__":
     main()
