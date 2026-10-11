@@ -62,8 +62,6 @@ class Compiler:
                     case ast.Constant() | ast.Name():
                         return [
                             Instr("movq", [self.select_arg(right), Variable(name)]),
-                            # Instr("movq", [self.select_arg(right), Reg("rax")]),
-                            #Instr("movq", [Reg("rax"), Variable(name)])
                         ]
 
                     case ast.Call(ast.Name("input_int"), []):
@@ -74,9 +72,8 @@ class Compiler:
 
                     case ast.UnaryOp(ast.USub(), value):
                         return [
-                            Instr("movq", [self.select_arg(value), Reg("rax")]),
-                            Instr("negq", [Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(name)])
+                            Instr("movq", [self.select_arg(value), Variable(name)]),
+                            Instr("negq", [Variable(name)]),
                         ]
 
                     case ast.BinOp(left, ast.Add(), right):
@@ -191,6 +188,7 @@ class Compiler:
                         match a:
                             case Deref("rbp", offset) if offset < 0:
                                 stack_space = max(stack_space, -offset)
+        stack_space = (stack_space + 15) // 16 * 16
 
         prologue = [
             Instr("pushq", [Reg("rbp")]),
@@ -240,7 +238,6 @@ def main():
     checkpoint(args, "assign_homes", assigned_homes)
     patched_instructions = compiler.patch_instructions(assigned_homes)
     checkpoint(args, "patch_instructions", patched_instructions)
-
     added_prelude_conclusion = compiler.prelude_and_conclusion(patched_instructions)
     checkpoint(args, "prelude_and_conclusion", added_prelude_conclusion)
 
