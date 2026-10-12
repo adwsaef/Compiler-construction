@@ -188,25 +188,37 @@ class Compiler:
     ############################################################################
     # Patch Instructions
     ############################################################################
+    def immediate_size(self, value: int) -> int:
+        if -(2 ** 31) <= value < 2 ** 31:
+            return 32
+        if -(2 ** 63) <= value < 2 ** 63:
+            return 64
+        raise Exception(f"Immediate value {value} does not fit in 64 bits")
+
     def patch_instr(self, i: instr) -> list[instr]:
         # Rax is only used for after call and for imulq
         match i:
             case Instr():
+                for a in i.args:
+                    if type(a) is Immediate:
+                        self.immediate_size(a.value)
+
                 match i.args:
                     case [source, destination] \
                             if i.instr == "imulq":
                         assert destination == Reg("rax")
                         if type(source) is Immediate \
-                                and (source.value >= 2**31
-                                     or source.value < -2**31):
+                                and self.immediate_size(source.value) == 64:
                             return [
                                 Instr("movq", [source, Reg("rcx")]),
                                 Instr("imulq", [Reg("rcx"), destination]),
                             ]
                         return [i]
 
-                    case [Immediate(value), destination] \
-                            if value >= 2**31 or value < -2**31:
+                    case [Immediate(value), destination]:
+                        size = self.immediate_size(value)
+                        if size == 32:
+                            return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
                         return [
