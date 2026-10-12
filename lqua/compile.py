@@ -3,8 +3,8 @@
 import ast
 import argparse
 from ast import (Constant, expr, stmt, Module, Name)
-from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg)
-from x86_interp import checkpoint, add_arguments, interp_x86
+from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
+from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 import os
 
 Binding = tuple[Name, expr]
@@ -114,6 +114,8 @@ class Compiler:
     def assign_homes_arg(self, a: arg, home: dict[Variable, arg]) -> arg:
         match a:
             case Variable():
+                if a not in home:
+                    raise Exception(f"Variable {a} used, before assigned")
                 return home[a]
             case _:
                 return a
@@ -121,27 +123,28 @@ class Compiler:
     def assign_homes_instr(self, i: instr,
                            home: dict[Variable, arg]) -> instr:
         match i:
-            case Instr(name, args):
-                return Instr(name, [self.assign_homes_arg(a, home) for a in args])
+            case Instr():
+                return Instr(
+                    i.instr,
+                    [self.assign_homes_arg(a, home) for a in i.args],
+                )
             case _:
                 return i
 
     def assign_homes(self, p: X86Program) -> X86Program:
         home: dict[Variable, arg] = {}
-        for i in p.body:
-            match i:
-                case Instr(_, args):
-                    for a in args:
-                        match a:
-                            case Variable():
-                                if a not in home:
-                                    home[a] = Deref("rbp", -8 * (len(home) + 1))
-
         instructions: list[instr] = []
+
         for i in p.body:
             match i:
-                case instr():
-                    instructions.append(self.assign_homes_instr(i, home))
+                case Instr():
+                    match i.target():
+                        case Variable() as variable:
+                            if variable not in home:
+                                home[variable] = Deref(
+                                    "rbp", -8 * (len(home) + 1)
+                                )
+            instructions.append(self.assign_homes_instr(i, home))
 
         return X86Program(instructions)
 
@@ -150,22 +153,23 @@ class Compiler:
     ############################################################################
     def patch_instr(self, i: instr) -> list[instr]:
         match i:
-            case Instr("movq", [Immediate(value), destination]) \
-                    if value >= 2**31 or value < -2**31:
-                return [
-                    Instr("movq", [Immediate(value), Reg("rax")]),
-                    Instr("movq", [Reg("rax"), destination]),
-                ]
+            case Instr():
+                match i.args:
+                    case [Immediate(value), destination] \
+                            if i.instr == "movq" \
+                            and (value >= 2**31 or value < -2**31):
+                        return [
+                            Instr("movq", [Immediate(value), Reg("rax")]),
+                            Instr("movq", [Reg("rax"), destination]),
+                        ]
 
-            case Instr(operation, [source, destination]) \
-                    if is_memory_arg(source) and is_memory_arg(destination):
-                return [
-                    Instr("movq", [source, Reg("rax")]),
-                    Instr(operation, [Reg("rax"), destination]),
-                ]
-
-            case _:
-                return [i]
+                    case [source, destination] \
+                            if is_memory_arg(source) and is_memory_arg(destination):
+                        return [
+                            Instr("movq", [source, Reg("rax")]),
+                            Instr(i.instr, [Reg("rax"), destination]),
+                        ]
+        return [i]
 
     def patch_instructions(self, p: X86Program) -> X86Program:
         instructions: list[instr] = []
@@ -183,11 +187,11 @@ class Compiler:
         stack_space = 0
         for i in p.body:
             match i:
-                case Instr(_, args):
-                    for a in args:
+                case Instr():
+                    for a in i.args:
                         match a:
-                            case Deref("rbp", offset) if offset < 0:
-                                stack_space = max(stack_space, -offset)
+                            case Deref() if a.reg == "rbp" and a.offset < 0:
+                                stack_space = max(stack_space, -a.offset)
         stack_space = (stack_space + 15) // 16 * 16
 
         prologue = [
