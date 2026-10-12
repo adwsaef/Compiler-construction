@@ -2,6 +2,13 @@
 # See EOC-LICENSE for details
 import ast
 import argparse
+import sys
+from pathlib import Path
+
+support_path = Path(__file__).resolve().parents[1] / "support"
+if str(support_path) not in sys.path:
+    sys.path.insert(0, str(support_path))
+
 from ast import (Constant, expr, stmt, Module, Name)
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
@@ -227,7 +234,7 @@ class Compiler:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
-    parser.add_argument("output")
+    parser.add_argument("output", nargs="?")
     add_arguments(parser)
     args = parser.parse_args()
 
@@ -249,8 +256,11 @@ def main():
         interp_x86(added_prelude_conclusion)
         return
 
-    with open(args.output, "w") as output_file:
-        output_file.write(str(added_prelude_conclusion))
+    if args.output is None:
+        print(added_prelude_conclusion, end="")
+    else:
+        with open(args.output, "w") as output_file:
+            output_file.write(str(added_prelude_conclusion))
 
 if __name__ == "__main__":
     main()
