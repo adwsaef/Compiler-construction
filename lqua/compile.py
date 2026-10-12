@@ -115,13 +115,6 @@ class Compiler:
                                 Instr("movq", [self.select_arg(left), Variable(lhs)]),
                                 Instr("subq", [self.select_arg(right), Variable(lhs)]),
                             ]
-
-                    case ast.BinOp(left, ast.Mult(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("imulq", [self.select_arg(right), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
             case _:
@@ -196,7 +189,7 @@ class Compiler:
         raise Exception(f"Immediate value {value} does not fit in 64 bits")
 
     def patch_instr(self, i: instr) -> list[instr]:
-        # Rax is only used for after call and for imulq
+        # Rax is only used for after call
         match i:
             case Instr():
                 for a in i.args:
@@ -204,17 +197,6 @@ class Compiler:
                         self.immediate_size(a.value)
 
                 match i.args:
-                    case [source, destination] \
-                            if i.instr == "imulq":
-                        assert destination == Reg("rax")
-                        if type(source) is Immediate \
-                                and self.immediate_size(source.value) == 64:
-                            return [
-                                Instr("movq", [source, Reg("rcx")]),
-                                Instr("imulq", [Reg("rcx"), destination]),
-                            ]
-                        return [i]
-
                     case [Immediate(value), destination]:
                         size = self.immediate_size(value)
                         if size == 32:
