@@ -57,73 +57,73 @@ class Compiler:
                     Callq("print_int", 1),
                 ]
 
-            case ast.Assign(targets=[ast.Name(name)], value=right):
-                match right:
+            case ast.Assign(targets=[ast.Name(lhs)], value=rhs):
+                match rhs:
                     case ast.Constant() | ast.Name():
+                        if type(rhs) is ast.Name and rhs.id == lhs:
+                            return []
                         return [
-                            Instr("movq", [self.select_arg(right), Variable(name)]),
+                            Instr("movq", [self.select_arg(rhs), Variable(lhs)]),
                         ]
 
                     case ast.Call(ast.Name("input_int"), []):
                         return [
                             Callq("input_int", 0),
-                            Instr("movq", [Reg("rax"), Variable(name)]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
                         ]
 
                     case ast.UnaryOp(ast.USub(), value):
-                        target = Variable(name)
-                        if type(value) is ast.Name and value.id == name:
+                        if type(value) is ast.Name and value.id == lhs:
                             return [
-                                Instr("negq", [target]),
+                                Instr("negq", [Variable(lhs)]),
                             ]
                         return [
-                            Instr("movq", [self.select_arg(value), target]),
-                            Instr("negq", [target]),
+                            Instr("movq", [self.select_arg(value), Variable(lhs)]),
+                            Instr("negq", [Variable(lhs)]),
                         ]
 
                     case ast.BinOp(left, ast.Add(), right):
-                        target = Variable(name)
-                        if type(left) is ast.Name and left.id == name:
+                        if type(left) is ast.Name and left.id == lhs:
                             return [
-                                Instr("addq", [self.select_arg(right), target]),
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
                             ]
 
-                        elif type(right) is ast.Name and right.id == name:
+                        elif type(right) is ast.Name and right.id == lhs:
                             return [
-                                Instr("addq", [self.select_arg(left), target]),
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
                             ]
                         else:
                             return [
-                                Instr("movq", [self.select_arg(left), target]),
-                                Instr("addq", [self.select_arg(right), target]),
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
                             ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        target = Variable(name)
-                        if type(left) is ast.Name and left.id == name:
+                        if type(left) is ast.Name and left.id == lhs:
                             return [
-                                Instr("subq", [self.select_arg(right), target]),
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
                             ]
 
-                        elif type(right) is ast.Name and right.id == name:
-                            # I can modify target, bcs operation already changes it, and I dont need it for left (previous branch)
+                        elif type(right) is ast.Name and right.id == lhs:
+                            # I can modify lhs, bcs operation already modifies it
+                            # It is not used in addq, bcs previous branch checks it
                             return [
-                                Instr("negq", [target]),
-                                Instr("addq", [self.select_arg(left), target]),
+                                Instr("negq", [Variable(lhs)]),
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
                             ]
                         else:
                             return [
-                                Instr("movq", [self.select_arg(left), target]),
-                                Instr("subq", [self.select_arg(right), target]),
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
                             ]
 
                     case ast.BinOp(left, ast.Mult(), right):
                         return [
                             Instr("movq", [self.select_arg(left), Reg("rax")]),
                             Instr("imulq", [self.select_arg(right), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(name)]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
                         ]
                     case _:
-                        raise Exception(f"Unrecognized right-hand side of assignment: {right}")
+                        raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
             case _:
                 raise Exception(f"Unexpected statement {s}, it must be assignment or print")
 
