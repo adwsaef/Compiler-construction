@@ -206,23 +206,13 @@ class Compiler:
             Instr("retq", []),
         ]
 
-        instructions: list[instr] = []
-        for instruction in prologue:
-            instructions.append(instruction)
+        assert isinstance(p.body, list), (
+            "prelude_and_conclusion expects a flat instruction list"
+        )
 
-        for instruction in p.body:
-            match instruction:
-                case instr():
-                    instructions.append(instruction)
-                case _:
-                    raise TypeError(
-                        "prelude_and_conclusion expects a flat instruction list"
-                    )
+        p.body = prologue + p.body + conclusion
 
-        for instruction in conclusion:
-            instructions.append(instruction)
-
-        return X86Program(instructions)
+        return p
 
 
 def main():
