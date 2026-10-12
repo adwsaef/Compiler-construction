@@ -6,7 +6,6 @@ import argparse
 from ast import (Constant, expr, stmt, Module, Name)
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
-import os
 
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
@@ -72,23 +71,50 @@ class Compiler:
                         ]
 
                     case ast.UnaryOp(ast.USub(), value):
+                        target = Variable(name)
+                        if isinstance(value, ast.Name) and value.id == name:
+                            return [
+                                Instr("negq", [target]),
+                            ]
                         return [
-                            Instr("movq", [self.select_arg(value), Variable(name)]),
-                            Instr("negq", [Variable(name)]),
+                            Instr("movq", [self.select_arg(value), target]),
+                            Instr("negq", [target]),
                         ]
 
                     case ast.BinOp(left, ast.Add(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("addq", [self.select_arg(right), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(name)]),
-                        ]
+                        target = Variable(name)
+                        if isinstance(left, ast.Name) and left.id == name:
+                            return [
+                                Instr("addq", [self.select_arg(right), target]),
+                            ]
+
+                        elif isinstance(right, ast.Name) and right.id == name:
+                            return [
+                                Instr("addq", [self.select_arg(left), target]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), target]),
+                                Instr("addq", [self.select_arg(right), target]),
+                            ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("subq", [self.select_arg(right), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(name)]),
-                        ]
+                        target = Variable(name)
+                        if isinstance(left, ast.Name) and left.id == name:
+                            return [
+                                Instr("subq", [self.select_arg(right), target]),
+                            ]
+
+                        elif isinstance(right, ast.Name) and right.id == name:
+                            # I can modify target, bcs operation already changes it, and I dont need it for left (previous branch)
+                            return [
+                                Instr("negq", [target]),
+                                Instr("addq", [self.select_arg(left), target]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), target]),
+                                Instr("subq", [self.select_arg(right), target]),
+                            ]
 
                     case ast.BinOp(left, ast.Mult(), right):
                         return [
@@ -153,15 +179,29 @@ class Compiler:
     # Patch Instructions
     ############################################################################
     def patch_instr(self, i: instr) -> list[instr]:
+        # Rax is only used for after call and for imulq
         match i:
             case Instr():
                 match i.args:
+                    case [source, destination] \
+                            if i.instr == "imulq":
+                        assert destination == Reg("rax")
+                        if isinstance(source, Immediate) \
+                                and (source.value >= 2**31
+                                     or source.value < -2**31):
+                            return [
+                                Instr("movq", [source, Reg("rcx")]),
+                                Instr("imulq", [Reg("rcx"), destination]),
+                            ]
+                        return [i]
+
                     case [Immediate(value), destination] \
-                            if i.instr == "movq" \
-                            and (value >= 2**31 or value < -2**31):
+                            if value >= 2**31 or value < -2**31:
+                        if i.instr == "movq" and isinstance(destination, Reg):
+                            return [i]
                         return [
                             Instr("movq", [Immediate(value), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), destination]),
+                            Instr(i.instr, [Reg("rax"), destination]),
                         ]
 
                     case [source, destination] \
@@ -201,7 +241,8 @@ class Compiler:
             Instr("subq", [Immediate(stack_space), Reg("rsp")]),
         ]
         conclusion = [
-            Instr("addq", [Immediate(stack_space), Reg("rsp")]),
+            Instr("movq", [Reg("rbp"), Reg("rsp")]),
+            Instr("movq", [Immediate(0), Reg("rax")]),
             Instr("popq", [Reg("rbp")]),
             Instr("retq", []),
         ]
@@ -241,7 +282,7 @@ def main():
         return
 
     if args.output is None:
-        print(added_prelude_conclusion, end="")
+        print(added_prelude_conclusion)
     else:
         with open(args.output, "w") as output_file:
             output_file.write(str(added_prelude_conclusion))
