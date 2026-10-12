@@ -72,7 +72,7 @@ class Compiler:
 
                     case ast.UnaryOp(ast.USub(), value):
                         target = Variable(name)
-                        if isinstance(value, ast.Name) and value.id == name:
+                        if type(value) is ast.Name and value.id == name:
                             return [
                                 Instr("negq", [target]),
                             ]
@@ -83,12 +83,12 @@ class Compiler:
 
                     case ast.BinOp(left, ast.Add(), right):
                         target = Variable(name)
-                        if isinstance(left, ast.Name) and left.id == name:
+                        if type(left) is ast.Name and left.id == name:
                             return [
                                 Instr("addq", [self.select_arg(right), target]),
                             ]
 
-                        elif isinstance(right, ast.Name) and right.id == name:
+                        elif type(right) is ast.Name and right.id == name:
                             return [
                                 Instr("addq", [self.select_arg(left), target]),
                             ]
@@ -99,12 +99,12 @@ class Compiler:
                             ]
                     case ast.BinOp(left, ast.Sub(), right):
                         target = Variable(name)
-                        if isinstance(left, ast.Name) and left.id == name:
+                        if type(left) is ast.Name and left.id == name:
                             return [
                                 Instr("subq", [self.select_arg(right), target]),
                             ]
 
-                        elif isinstance(right, ast.Name) and right.id == name:
+                        elif type(right) is ast.Name and right.id == name:
                             # I can modify target, bcs operation already changes it, and I dont need it for left (previous branch)
                             return [
                                 Instr("negq", [target]),
@@ -186,7 +186,7 @@ class Compiler:
                     case [source, destination] \
                             if i.instr == "imulq":
                         assert destination == Reg("rax")
-                        if isinstance(source, Immediate) \
+                        if type(source) is Immediate \
                                 and (source.value >= 2**31
                                      or source.value < -2**31):
                             return [
@@ -197,7 +197,7 @@ class Compiler:
 
                     case [Immediate(value), destination] \
                             if value >= 2**31 or value < -2**31:
-                        if i.instr == "movq" and isinstance(destination, Reg):
+                        if i.instr == "movq" and type(destination) is Reg:
                             return [i]
                         return [
                             Instr("movq", [Immediate(value), Reg("rax")]),
@@ -247,7 +247,7 @@ class Compiler:
             Instr("retq", []),
         ]
 
-        assert isinstance(p.body, list), (
+        assert type(p.body) is list, (
             "prelude_and_conclusion expects a flat instruction list"
         )
 
