@@ -138,6 +138,28 @@ class Compiler:
     # Assign Homes
     ############################################################################
 
+    def verify_variables_initialized(self, p: X86Program) -> None:
+        initialized: set[Variable] = set()
+
+        for i in p.body:
+            if type(i) is not Instr:
+                continue
+
+            reads = i.args
+            writes: tuple[arg, ...] = ()
+            if i.instr == "movq":
+                reads = i.args[:1]
+                writes = i.args[1:]
+
+            for a in reads:
+                if type(a) is Variable and a not in initialized:
+                    raise Exception(f"Variable {a} used before assignment")
+
+            initialized.update(
+                a for a in writes
+                if type(a) is Variable
+            )
+
     def assign_homes_arg(self, a: arg, home: dict[Variable, arg]) -> arg:
         match a:
             case Variable():
@@ -158,7 +180,8 @@ class Compiler:
                 return i
 
     def assign_homes(self, p: X86Program) -> X86Program:
-        assert isinstance(p.body, list)
+        assert type(p.body) is list
+        self.verify_variables_initialized(p)
         home: dict[Variable, arg] = {}
         return X86Program([self.assign_homes_instr(i, home) for i in p.body])
 
