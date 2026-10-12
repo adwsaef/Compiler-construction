@@ -1,3 +1,5 @@
+#   gcc output.s support/runtime.c -o output to run instead of interpret
+
 import os
 import subprocess
 import sys
