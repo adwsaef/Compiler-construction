@@ -142,13 +142,12 @@ class Compiler:
         match a:
             case Variable():
                 if a not in home:
-                    raise Exception(f"Variable {a} used, before assigned")
+                    home[a] = Deref("rbp", -8 * (len(home) + 1))
                 return home[a]
             case _:
                 return a
 
-    def assign_homes_instr(self, i: instr,
-                           home: dict[Variable, arg]) -> instr:
+    def assign_homes_instr(self, i: instr, home: dict[Variable, arg]) -> instr:
         match i:
             case Instr():
                 return Instr(
@@ -159,21 +158,9 @@ class Compiler:
                 return i
 
     def assign_homes(self, p: X86Program) -> X86Program:
+        assert isinstance(p.body, list)
         home: dict[Variable, arg] = {}
-        instructions: list[instr] = []
-
-        for i in p.body:
-            match i:
-                case Instr():
-                    match i.target():
-                        case Variable() as variable:
-                            if variable not in home:
-                                home[variable] = Deref(
-                                    "rbp", -8 * (len(home) + 1)
-                                )
-            instructions.append(self.assign_homes_instr(i, home))
-
-        return X86Program(instructions)
+        return X86Program([self.assign_homes_instr(i, home) for i in p.body])
 
     ############################################################################
     # Patch Instructions
