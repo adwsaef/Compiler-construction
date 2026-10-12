@@ -8,6 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TEST_DIR = Path(__file__).resolve().parent
 
+env = os.environ.copy()
+env["PYTHONPATH"] = str(ROOT / "support") + os.pathsep + env.get("PYTHONPATH", "")
+
 def run_test(source, should_pass):
     input_file = source.with_suffix(".in")
     input_text = input_file.read_text() if input_file.exists() else ""
@@ -22,6 +25,7 @@ def run_test(source, should_pass):
         input=input_text,
         text=True,
         capture_output=True,
+        env=env,
     )
 
     if should_pass:

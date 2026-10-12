@@ -2,12 +2,6 @@
 # See EOC-LICENSE for details
 import ast
 import argparse
-import sys
-from pathlib import Path
-
-support_path = Path(__file__).resolve().parents[1] / "support"
-if str(support_path) not in sys.path:
-    sys.path.insert(0, str(support_path))
 
 from ast import (Constant, expr, stmt, Module, Name)
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
