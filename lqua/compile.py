@@ -60,11 +60,7 @@ class Compiler:
             case ast.Assign(targets=[ast.Name(lhs)], value=rhs):
                 match rhs:
                     case ast.Constant() | ast.Name():
-                        if type(rhs) is ast.Name and rhs.id == lhs:
-                            return []
-                        return [
-                            Instr("movq", [self.select_arg(rhs), Variable(lhs)]),
-                        ]
+                        return [Instr("movq", [self.select_arg(rhs), Variable(lhs)])]
 
                     case ast.Call(ast.Name("input_int"), []):
                         return [
@@ -73,48 +69,30 @@ class Compiler:
                         ]
 
                     case ast.UnaryOp(ast.USub(), value):
-                        if type(value) is ast.Name and value.id == lhs:
-                            return [
-                                Instr("negq", [Variable(lhs)]),
-                            ]
                         return [
                             Instr("movq", [self.select_arg(value), Variable(lhs)]),
                             Instr("negq", [Variable(lhs)]),
                         ]
 
                     case ast.BinOp(left, ast.Add(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-
-                        elif type(right) is ast.Name and right.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
+                            Instr("addq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
+                        ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-
-                        elif type(right) is ast.Name and right.id == lhs:
-                            # I can modify lhs, bcs operation already modifies it
-                            # It is not used in addq, bcs previous branch checks it
-                            return [
-                                Instr("negq", [Variable(lhs)]),
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
+                            Instr("subq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
+                        ]
+                    case ast.BinOp(left, ast.FloorDiv(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("cqto", []),
+                            Instr("idivq", [self.select_arg(right)]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
+                        ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
             case _:
