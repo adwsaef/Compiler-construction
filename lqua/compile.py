@@ -86,12 +86,27 @@ class Compiler:
                             Instr("subq", [self.select_arg(right), Reg("rcx")]),
                             Instr("movq", [Reg("rcx"), Variable(lhs)]),
                         ]
+                    case ast.BinOp(left, ast.Mult(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("imulq", [self.select_arg(right), Reg("rax")]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
+                        ]
                     case ast.BinOp(left, ast.FloorDiv(), right):
                         return [
                             Instr("movq", [self.select_arg(left), Reg("rax")]),
                             Instr("cqto", []),
-                            Instr("idivq", [self.select_arg(right)]),
+                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("idivq", [Reg("rcx")]),
                             Instr("movq", [Reg("rax"), Variable(lhs)]),
+                        ]
+                    case ast.BinOp(left, ast.Mod(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("cqto", []),
+                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("idivq", [Reg("rcx")]),
+                            Instr("movq", [Reg("rdx"), Variable(lhs)]),
                         ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
@@ -188,6 +203,7 @@ class Compiler:
 
                     case [source, destination] \
                             if is_memory_arg(source) and is_memory_arg(destination):
+                        
                         return [
                             Instr("movq", [source, Reg("rax")]),
                             Instr(i.instr, [Reg("rax"), destination]),
