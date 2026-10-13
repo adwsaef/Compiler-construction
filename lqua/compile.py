@@ -203,7 +203,6 @@ class Compiler:
 
                     case [source, destination] \
                             if is_memory_arg(source) and is_memory_arg(destination):
-                        
                         return [
                             Instr("movq", [source, Reg("rax")]),
                             Instr(i.instr, [Reg("rax"), destination]),
