@@ -4,6 +4,7 @@ import ast
 import argparse
 
 from ast import (Constant, expr, stmt, Module, Name)
+from ast_utils import generate_name  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
@@ -19,16 +20,65 @@ class Compiler:
     ############################################################################
 
     def rco_exp(self, e: expr, need_atomic : bool) -> tuple[expr, Temporaries]:
-        # YOUR CODE HERE
-        pass        
+        match e:
+            case ast.Constant() | ast.Name():
+                return e, []
+
+            case ast.Call(ast.Name("input_int"), []):
+                if not need_atomic:
+                    return e, []
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, [(temporary, e)]
+
+            case ast.UnaryOp(operator, operand):
+                atomic_operand, temporaries = self.rco_exp(operand, True)
+                result = ast.UnaryOp(operator, atomic_operand)
+
+            case ast.BinOp(left, operator, right):
+                atomic_left, left_temporaries = self.rco_exp(left, True)
+                atomic_right, right_temporaries = self.rco_exp(right, True)
+                binop = ast.BinOp(atomic_left, operator, atomic_right)
+                if need_atomic:
+                    temporary = ast.Name(generate_name("tmp"))
+                    return temporary, left_temporaries + right_temporaries + [(temporary, binop)]
+                return binop, left_temporaries + right_temporaries
+            case _:
+                raise Exception(f"Unexpected expression during RCO: {e}")
+
+        if not need_atomic:
+            return result, temporaries
+
+        temporary = ast.Name(generate_name("tmp"))
+        return temporary, temporaries + [(temporary, result)]
 
     def rco_stmt(self, s: stmt) -> list[stmt]:
-        # YOUR CODE HERE
-        pass        
+        match s:
+            case ast.Expr(ast.Call(ast.Name("print"), [value])):
+                atom, temporaries = self.rco_exp(value, True)
+                statements: list[stmt] = [
+                    ast.Assign([name], temporary)
+                    for name, temporary in temporaries
+                ]
+                statements.append(ast.Expr(ast.Call(ast.Name("print"), [atom])))
+                return statements
+
+            case ast.Assign([ast.Name(name)], value):
+                expression, temporaries = self.rco_exp(value, False)
+                statements = [
+                    ast.Assign([temporary_name], temporary_value)
+                    for temporary_name, temporary_value in temporaries
+                ]
+                statements.append(ast.Assign([ast.Name(name)], expression))
+                return statements
+            case _:
+                raise Exception(f"Unexpected statement during RCO: {s}")
 
     def remove_complex_operands(self, p: Module) -> Module:
-        # YOUR CODE HERE
-        pass                
+        statements: list[stmt] = []
+        for statement in p.body:
+            statements.extend(self.rco_stmt(statement))
+        return ast.Module(statements, p.type_ignores)
 
     ############################################################################
     # Select Instructions
@@ -60,11 +110,7 @@ class Compiler:
             case ast.Assign(targets=[ast.Name(lhs)], value=rhs):
                 match rhs:
                     case ast.Constant() | ast.Name():
-                        if type(rhs) is ast.Name and rhs.id == lhs:
-                            return []
-                        return [
-                            Instr("movq", [self.select_arg(rhs), Variable(lhs)]),
-                        ]
+                        return [Instr("movq", [self.select_arg(rhs), Variable(lhs)])]
 
                     case ast.Call(ast.Name("input_int"), []):
                         return [
@@ -73,48 +119,45 @@ class Compiler:
                         ]
 
                     case ast.UnaryOp(ast.USub(), value):
-                        if type(value) is ast.Name and value.id == lhs:
-                            return [
-                                Instr("negq", [Variable(lhs)]),
-                            ]
                         return [
                             Instr("movq", [self.select_arg(value), Variable(lhs)]),
                             Instr("negq", [Variable(lhs)]),
                         ]
 
                     case ast.BinOp(left, ast.Add(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-
-                        elif type(right) is ast.Name and right.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
+                            Instr("addq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
+                        ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-
-                        elif type(right) is ast.Name and right.id == lhs:
-                            # I can modify lhs, bcs operation already modifies it
-                            # It is not used in addq, bcs previous branch checks it
-                            return [
-                                Instr("negq", [Variable(lhs)]),
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
+                            Instr("subq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
+                        ]
+                    case ast.BinOp(left, ast.Mult(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("imulq", [self.select_arg(right), Reg("rax")]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
+                        ]
+                    case ast.BinOp(left, ast.FloorDiv(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("cqto", []),
+                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("idivq", [Reg("rcx")]),
+                            Instr("movq", [Reg("rax"), Variable(lhs)]),
+                        ]
+                    case ast.BinOp(left, ast.Mod(), right):
+                        return [
+                            Instr("movq", [self.select_arg(left), Reg("rax")]),
+                            Instr("cqto", []),
+                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
+                            Instr("idivq", [Reg("rcx")]),
+                            Instr("movq", [Reg("rdx"), Variable(lhs)]),
+                        ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
             case _:
@@ -203,9 +246,10 @@ class Compiler:
                             return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
+                        scratch = Reg("rcx") if destination == Reg("rax") else Reg("rax")
                         return [
-                            Instr("movq", [Immediate(value), Reg("rax")]),
-                            Instr(i.instr, [Reg("rax"), destination]),
+                            Instr("movq", [Immediate(value), scratch]),
+                            Instr(i.instr, [scratch, destination]),
                         ]
 
                     case [source, destination] \
@@ -272,7 +316,8 @@ def main():
 
     compiler = Compiler()
 
-    instruction_list = compiler.select_instructions(module)
+    simplified = compiler.remove_complex_operands(module)
+    instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
     assigned_homes = compiler.assign_homes(instruction_list)
     checkpoint(args, "assign_homes", assigned_homes)
