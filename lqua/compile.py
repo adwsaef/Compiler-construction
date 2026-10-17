@@ -246,9 +246,10 @@ class Compiler:
                             return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
+                        scratch = Reg("rcx") if destination == Reg("rax") else Reg("rax")
                         return [
-                            Instr("movq", [Immediate(value), Reg("rax")]),
-                            Instr(i.instr, [Reg("rax"), destination]),
+                            Instr("movq", [Immediate(value), scratch]),
+                            Instr(i.instr, [scratch, destination]),
                         ]
 
                     case [source, destination] \
