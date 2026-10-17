@@ -64,12 +64,12 @@ class Compiler:
                 return statements
 
             case ast.Assign([ast.Name(name)], value):
-                atom, temporaries = self.rco_exp(value, True)
+                expression, temporaries = self.rco_exp(value, False)
                 statements = [
                     ast.Assign([temporary_name], temporary_value)
                     for temporary_name, temporary_value in temporaries
                 ]
-                statements.append(ast.Assign([ast.Name(name)], atom))
+                statements.append(ast.Assign([ast.Name(name)], expression))
                 return statements
             case _:
                 raise Exception(f"Unexpected statement during RCO: {s}")
