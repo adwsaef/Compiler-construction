@@ -1,0 +1,1 @@
+print(((input_int() * (7 + 3) + (2 * (input_int() - 4))) * (5 - (input_int() + 1))) + ((input_int() * 100) - (9 - (input_int() * 3))))
