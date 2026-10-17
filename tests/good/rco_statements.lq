@@ -1,4 +1,0 @@
-x = -(2 + (input_int() * (3 + 1)))
-print(x + (input_int() * (5 - 2)))
-x = x - (input_int() * (7 - 4))
-print(x)
