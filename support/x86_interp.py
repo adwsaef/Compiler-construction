@@ -803,7 +803,7 @@ def interp_x86(prog: Program | ast.Module, **kwargs) -> list[int] | None:
     """Print a Python module, or interpret an x86 program."""
     match prog:
         case ast.Module():
-            print(ast.unparse(prog))
+            print(ast.unparse(ast.fix_missing_locations(prog)))
             return None
         case _:
             return run(blocks_of(prog), **kwargs)
