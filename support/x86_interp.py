@@ -17,6 +17,7 @@ Important simplifications:
   - flags are a single three-way value, the sign of the last ALU result.
 """
 
+import ast
 import sys
 from typing import Callable, TextIO
 
@@ -798,9 +799,14 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
     return machine.run(max_steps)
 
 
-def interp_x86(prog: Program, **kwargs) -> list[int]:
-    """Interpret a program the compilers built.  A thin adapter over run()."""
-    return run(blocks_of(prog), **kwargs)
+def interp_x86(prog: Program | ast.Module, **kwargs) -> list[int] | None:
+    """Print a Python module, or interpret an x86 program."""
+    match prog:
+        case ast.Module():
+            print(ast.unparse(prog))
+            return None
+        case _:
+            return run(blocks_of(prog), **kwargs)
 
 
 # ------------------------------------------------- driver-side conveniences
@@ -809,7 +815,7 @@ def interp_x86(prog: Program, **kwargs) -> list[int]:
 # finished program, and a --interp-after PASS that runs an intermediate one.
 # They live here so that there is one implementation rather than five.
 
-PASSES = ['select_instructions', 'assign_homes', 'allocate_registers', 'patch_instructions',
+PASSES = ['remove_complex_operands', 'select_instructions', 'assign_homes', 'allocate_registers', 'patch_instructions',
           'prelude_and_conclusion']
 
 
@@ -824,7 +830,7 @@ def add_arguments(parser) -> None:
                              'then stop: ' + ', '.join(PASSES))
 
 
-def checkpoint(args, pass_name: str, prog: Program) -> None:
+def checkpoint(args, pass_name: str, prog: Program | ast.Module) -> None:
     """Interpret and stop, if --interp-after named this pass.
 
     Called after each back-end pass.  Interpreting between passes is what

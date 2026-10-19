@@ -35,22 +35,24 @@ class Compiler:
                 atomic_operand, temporaries = self.rco_exp(operand, True)
                 result = ast.UnaryOp(operator, atomic_operand)
 
+                if not need_atomic:
+                    return result, temporaries
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, temporaries + [(temporary, result)]
+
             case ast.BinOp(left, operator, right):
                 atomic_left, left_temporaries = self.rco_exp(left, True)
                 atomic_right, right_temporaries = self.rco_exp(right, True)
                 binop = ast.BinOp(atomic_left, operator, atomic_right)
-                if need_atomic:
-                    temporary = ast.Name(generate_name("tmp"))
-                    return temporary, left_temporaries + right_temporaries + [(temporary, binop)]
-                return binop, left_temporaries + right_temporaries
+
+                if not need_atomic:
+                    return binop, left_temporaries + right_temporaries
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, left_temporaries + right_temporaries + [(temporary, binop)]
             case _:
                 raise Exception(f"Unexpected expression during RCO: {e}")
-
-        if not need_atomic:
-            return result, temporaries
-
-        temporary = ast.Name(generate_name("tmp"))
-        return temporary, temporaries + [(temporary, result)]
 
     def rco_stmt(self, s: stmt) -> list[stmt]:
         match s:
@@ -78,7 +80,7 @@ class Compiler:
         statements: list[stmt] = []
         for statement in p.body:
             statements.extend(self.rco_stmt(statement))
-        return ast.Module(statements, p.type_ignores)
+        return ast.Module(statements)
 
     ############################################################################
     # Select Instructions
@@ -317,6 +319,7 @@ def main():
     compiler = Compiler()
 
     simplified = compiler.remove_complex_operands(module)
+    checkpoint(args, "remove_complex_operands", simplified)
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
     assigned_homes = compiler.assign_homes(instruction_list)
