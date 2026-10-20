@@ -125,40 +125,45 @@ class Compiler:
                             Instr("movq", [self.select_arg(value), Variable(lhs)]),
                             Instr("negq", [Variable(lhs)]),
                         ]
-
                     case ast.BinOp(left, ast.Add(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
-                            Instr("addq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
-                        ]
+                        if type(left) is ast.Name and left.id == lhs:
+                            return [
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
+                            ]
+                        elif type(right) is ast.Name and right.id == lhs:
+                            return [
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
+                            ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
-                            Instr("subq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
-                        ]
+                        if type(left) is ast.Name and left.id == lhs:
+                            return [
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
+                            ]
+                        elif type(right) is ast.Name and right.id == lhs:
+                            return [
+                                Instr("negq", [Variable(lhs)]),
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
+                            ]
                     case ast.BinOp(left, ast.Mult(), right):
+                        if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+                            return [
+                                Instr("movq", [self.select_arg(Constant(left.value * right.value)), Variable(lhs)])
+                            ]
+                        
                         return [
                             Instr("movq", [self.select_arg(left), Reg("rax")]),
                             Instr("imulq", [self.select_arg(right), Reg("rax")]),
                             Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
-                    case ast.BinOp(left, ast.FloorDiv(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("cqto", []),
-                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("idivq", [Reg("rcx")]),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
-                    case ast.BinOp(left, ast.Mod(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("cqto", []),
-                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("idivq", [Reg("rcx")]),
-                            Instr("movq", [Reg("rdx"), Variable(lhs)]),
                         ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
