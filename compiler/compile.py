@@ -155,14 +155,20 @@ class Compiler:
                                 Instr("subq", [self.select_arg(right), Variable(lhs)]),
                             ]
                     case ast.BinOp(left, ast.Mult(), right):
-                        if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+                        left_arg = self.select_arg(left)
+                        right_arg = self.select_arg(right)
+                        if isinstance(left_arg, Immediate) and isinstance(right_arg, Immediate):
                             return [
-                                Instr("movq", [self.select_arg(Constant(left.value * right.value)), Variable(lhs)])
+                                Instr("movq", [Immediate(left_arg.value * right_arg.value), Variable(lhs)])
                             ]
-                        
+
+                        if isinstance(right_arg, Immediate):
+                            left_arg, right_arg = right_arg, left_arg
+
+                        # Right arg is not immadiete, emitted imulq is correct.
                         return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("imulq", [self.select_arg(right), Reg("rax")]),
+                            Instr("movq", [left_arg, Reg("rax")]),
+                            Instr("imulq", [right_arg, Reg("rax")]),
                             Instr("movq", [Reg("rax"), Variable(lhs)]),
                         ]
                     case _:
@@ -253,7 +259,7 @@ class Compiler:
                             return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
-                        scratch = Reg("rcx") if destination == Reg("rax") else Reg("rax")
+                        scratch = Reg("rax")
                         return [
                             Instr("movq", [Immediate(value), scratch]),
                             Instr(i.instr, [scratch, destination]),
