@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-COMPILER = ROOT / "lqua" / "compile.py"
+COMPILER = ROOT / "compiler" / "compile.py"
 RUNTIME = ROOT / "support" / "runtime.c"
 TESTS = Path(__file__).resolve().parent
 
