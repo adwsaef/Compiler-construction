@@ -2,6 +2,8 @@
 # See EOC-LICENSE for details
 import ast
 import argparse
+import sys
+from collections.abc import Sequence
 
 from ast import (Constant, expr, stmt, Module, Name)
 from ast_utils import generate_name  # type: ignore[import-untyped]
@@ -10,6 +12,25 @@ from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[impo
 
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
+
+SCRATCH_REGISTER = Reg("rax")
+ARGUMENT_REGISTERS = (
+    Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
+)
+CALLEE_SAVED_REGISTERS = (
+    Reg("rbx"), Reg("r12"), Reg("r13"), Reg("r14"), Reg("r15"),
+)
+CALLER_SAVED_REGISTERS = (
+    SCRATCH_REGISTER, Reg("rcx"), Reg("rdx"), Reg("rsi"), Reg("rdi"),
+    Reg("r8"), Reg("r9"), Reg("r10"), Reg("r11"),
+)
+RESERVED_REGISTERS = (
+    Reg("rax"), Reg("rsp"), Reg("rbp"), Reg("r11"), Reg("r15"),
+)
+AVAILABLE_REGISTERS = tuple(
+    register for register in CALLEE_SAVED_REGISTERS + CALLER_SAVED_REGISTERS
+    if register not in RESERVED_REGISTERS
+)
 
 
 class Compiler:
@@ -125,40 +146,51 @@ class Compiler:
                             Instr("movq", [self.select_arg(value), Variable(lhs)]),
                             Instr("negq", [Variable(lhs)]),
                         ]
-
                     case ast.BinOp(left, ast.Add(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
-                            Instr("addq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
-                        ]
+                        if type(left) is ast.Name and left.id == lhs:
+                            return [
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
+                            ]
+                        elif type(right) is ast.Name and right.id == lhs:
+                            return [
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
+                            ]
                     case ast.BinOp(left, ast.Sub(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rcx")]),
-                            Instr("subq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("movq", [Reg("rcx"), Variable(lhs)]),
-                        ]
+                        if type(left) is ast.Name and left.id == lhs:
+                            return [
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
+                            ]
+                        elif type(right) is ast.Name and right.id == lhs:
+                            return [
+                                Instr("negq", [Variable(lhs)]),
+                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
+                            ]
+                        else:
+                            return [
+                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
+                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
+                            ]
                     case ast.BinOp(left, ast.Mult(), right):
+                        left_arg = self.select_arg(left)
+                        right_arg = self.select_arg(right)
+                        if isinstance(left_arg, Immediate) and isinstance(right_arg, Immediate):
+                            return [
+                                Instr("movq", [Immediate(left_arg.value * right_arg.value), Variable(lhs)])
+                            ]
+
+                        if isinstance(right_arg, Immediate):
+                            left_arg, right_arg = right_arg, left_arg
+
+                        # Right arg is not immadiete, emitted imulq is correct.
                         return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("imulq", [self.select_arg(right), Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
-                    case ast.BinOp(left, ast.FloorDiv(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("cqto", []),
-                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("idivq", [Reg("rcx")]),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
-                    case ast.BinOp(left, ast.Mod(), right):
-                        return [
-                            Instr("movq", [self.select_arg(left), Reg("rax")]),
-                            Instr("cqto", []),
-                            Instr("movq", [self.select_arg(right), Reg("rcx")]),
-                            Instr("idivq", [Reg("rcx")]),
-                            Instr("movq", [Reg("rdx"), Variable(lhs)]),
+                            Instr("movq", [left_arg, SCRATCH_REGISTER]),
+                            Instr("imulq", [right_arg, SCRATCH_REGISTER]),
+                            Instr("movq", [SCRATCH_REGISTER, Variable(lhs)]),
                         ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
@@ -173,55 +205,228 @@ class Compiler:
 
 
     ############################################################################
-    # Assign Homes
+    # Register Allocation
     ############################################################################
 
-    def verify_variables_initialized(self, p: X86Program) -> None:
-        initialized: set[Variable] = set()
+    def operand_locations(self, operand: arg) -> set[arg]:
+        match operand:
+            case Variable() | Reg():
+                return {operand}
+            case Immediate():
+                return set()
+            case _:
+                raise ValueError(f"Unexpected register allocation operand: {operand}")
 
-        for i in p.body:
-            if type(i) is not Instr:
-                continue
+    def instruction_read(self, instruction: instr) -> set[arg]:
+        match instruction:
+            case Callq(num_args=arity):
+                return set(ARGUMENT_REGISTERS[:arity])
+            case Instr(instr="movq", args=[source, _]):
+                return self.operand_locations(source)
+            case Instr(
+                instr="addq" | "subq" | "imulq",
+                args=[source, destination],
+            ):
+                return self.operand_locations(source) | self.operand_locations(destination)
+            case Instr(instr="negq", args=[destination]):
+                return self.operand_locations(destination)
+            case _:
+                raise ValueError(f"Reads are not defined for {instruction}")
 
-            reads = i.args
-            writes: tuple[arg, ...] = ()
-            if i.instr == "movq":
-                reads = i.args[:1]
-                writes = i.args[1:]
+    def instruction_write(self, instruction: instr) -> set[arg]:
+        match instruction:
+            case Callq():
+                return set(CALLER_SAVED_REGISTERS)
+            case Instr(
+                instr="movq" | "addq" | "subq" | "imulq",
+                args=[_, destination],
+            ) | Instr(instr="negq", args=[destination]):
+                return self.operand_locations(destination)
+            case _:
+                raise ValueError(f"Writes are not defined for {instruction}")
 
-            for a in reads:
-                if type(a) is Variable and a not in initialized:
-                    raise Exception(f"Variable {a} used before assignment")
+    def uncover_live(self, p: X86Program) -> dict[int, set[arg]]:
+        assert isinstance(p.body, list)
+        live: set[arg] = set()
+        live_after: dict[int, set[arg]] = {}
+        for index in reversed(range(len(p.body))):
+            live_after[index] = live.copy()
+            reads = self.instruction_read(p.body[index])
+            writes = self.instruction_write(p.body[index])
+            live = (live - writes) | reads
+        return live_after
 
-            initialized.update(
-                a for a in writes
-                if type(a) is Variable
+    def instruction_edges(
+        self,
+        instruction: instr,
+        live_after: set[arg],
+        writes: set[arg],
+    ) -> set[tuple[arg, arg]]:
+        match instruction:
+            case Instr(instr="movq", args=[source, _]):
+                neighbors = live_after - {source}
+            case _:
+                neighbors = live_after
+        return {
+            (destination, neighbor)
+            for destination in writes
+            for neighbor in neighbors
+            if neighbor != destination
+        }
+
+    def build_interface_graph(
+        self,
+        p: X86Program,
+        live_after: dict[int, set[arg]],
+    ) -> tuple[dict[arg, set[arg]], dict[int, set[tuple[arg, arg]]]]:
+        assert isinstance(p.body, list)
+        graph: dict[arg, set[arg]] = {}
+        edges_by_index: dict[int, set[tuple[arg, arg]]] = {}
+        for index, instruction in enumerate(p.body):
+            writes = self.instruction_write(instruction)
+            for location in live_after[index] | writes:
+                graph.setdefault(location, set())
+
+            edges = self.instruction_edges(instruction, live_after[index], writes)
+            for destination, neighbor in edges:
+                graph[destination].add(neighbor)
+                graph[neighbor].add(destination)
+            edges_by_index[index] = edges
+        return graph, edges_by_index
+
+
+    def debug_print_live(
+        self,
+        p: X86Program,
+        live_after: dict[int, set[arg]],
+        edges_by_index: dict[int, set[tuple[arg, arg]]],
+    ) -> None:
+        assert isinstance(p.body, list)
+        rows: list[tuple[str, str, str]] = []
+        for index, instruction in enumerate(p.body):
+            instruction_text = str(instruction).strip()
+            live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
+            edge_text = ", ".join(
+                f"{destination}-{neighbor}"
+                for destination, neighbor in sorted(
+                    edges_by_index[index],
+                    key=lambda edge: (str(edge[0]), str(edge[1])),
+                )
+            ) or "--"
+            rows.append((instruction_text, live_text, edge_text))
+
+        instruction_width = max((len(row[0]) for row in rows), default=0)
+        instruction_width = max(instruction_width, len("Instruction"))
+        live_width = max((len(row[1]) for row in rows), default=0)
+        live_width = max(live_width, len("live-after"))
+        print(
+            f"{'Instruction':<{instruction_width}}  "
+            f"{'live-after':<{live_width}}  edges added",
+            file=sys.stderr,
+        )
+        for instruction_text, live_text, edge_text in rows:
+            print(
+                f"{instruction_text:<{instruction_width}}  "
+                f"{live_text:<{live_width}}  {edge_text}",
+                file=sys.stderr,
             )
 
-    def assign_homes_arg(self, a: arg, home: dict[Variable, arg]) -> arg:
-        match a:
-            case Variable():
-                if a not in home:
-                    home[a] = Deref("rbp", -8 * (len(home) + 1))
-                return home[a]
-            case _:
-                return a
+    def color_graph(
+        self, graph: dict[arg, set[arg]], colors: Sequence[int],
+        precolored: dict[arg, int]
+    ) -> dict[arg, int]:
+        """Color a graph by highest saturation, using the first free color."""
+        color = precolored.copy()
+        uncolored = set(graph) - color.keys()
+        while uncolored:
+            vertex = max(
+                uncolored,
+                key=lambda v: (
+                    len({color[n] for n in graph[v] if n in color}),
+                    len(graph[v]),
+                    str(v),
+                ),
+            )
+            used = {color[n] for n in graph[vertex] if n in color}
+            available = next((c for c in colors if c not in used), None)
+            if available is None:
+                raise ValueError(f"No color available for {vertex}")
+            color[vertex] = available
+            uncolored.remove(vertex)
+        return color
 
-    def assign_homes_instr(self, i: instr, home: dict[Variable, arg]) -> instr:
-        match i:
-            case Instr():
-                return Instr(
-                    i.instr,
-                    [self.assign_homes_arg(a, home) for a in i.args],
-                )
-            case _:
-                return i
+    def allocate_registers(
+        self,
+        p: X86Program,
+        registers_cap: int = len(AVAILABLE_REGISTERS),
+        debug: bool = False,
+    ) -> X86Program:
+        """Replace variables with up to registers_cap registers or stack slots."""
+        if not 0 <= registers_cap <= len(AVAILABLE_REGISTERS):
+            raise ValueError(
+                f"registers_cap must be between 0 and {len(AVAILABLE_REGISTERS)}"
+            )
+        assert isinstance(p.body, list)
+        defined: set[arg] = set()
+        for instruction in p.body:
+            unassigned = {
+                location for location in self.instruction_read(instruction)
+                if isinstance(location, Variable) and location not in defined
+            }
+            if unassigned:
+                names = ", ".join(sorted(str(location) for location in unassigned))
+                raise ValueError(f"Variable read before assignment: {names}")
+            defined.update(
+                location for location in self.instruction_write(instruction)
+                if isinstance(location, Variable)
+            )
+        live_after = self.uncover_live(p)
+        graph, edges_by_index = self.build_interface_graph(p, live_after)
 
-    def assign_homes(self, p: X86Program) -> X86Program:
-        assert type(p.body) is list
-        self.verify_variables_initialized(p)
-        home: dict[Variable, arg] = {}
-        return X86Program([self.assign_homes_instr(i, home) for i in p.body])
+        fixed_registers = RESERVED_REGISTERS + AVAILABLE_REGISTERS
+        register_colors = {
+            register: index for index, register in enumerate(fixed_registers)
+        }
+        precolored: dict[arg, int] = {
+            register: register_colors[register]
+            for register in graph if isinstance(register, Reg)
+        }
+        spill_start = len(fixed_registers)
+        colors = [
+            register_colors[register]
+            for register in AVAILABLE_REGISTERS[:registers_cap]
+        ] + list(range(spill_start, spill_start + len(graph)))
+        coloring = self.color_graph(graph, colors, precolored)
+        spill_colors = sorted({
+            coloring[location] for location in graph
+            if isinstance(location, Variable) and coloring[location] >= spill_start
+        })
+        spill_homes = {
+            color: Deref("rbp", -8 * (len(CALLEE_SAVED_REGISTERS) + slot))
+            for slot, color in enumerate(spill_colors, start=1)
+        }
+        homes: dict[Variable, arg] = {
+            location: (
+                fixed_registers[coloring[location]]
+                if coloring[location] < spill_start
+                else spill_homes[coloring[location]]
+            )
+            for location in graph if isinstance(location, Variable)
+        }
+        if debug:
+            self.debug_print_live(p, live_after, edges_by_index)
+        p.body = [
+            Instr(
+                instruction.instr,
+                [
+                    homes[operand] if isinstance(operand, Variable) else operand
+                    for operand in instruction.args
+                ],
+            )
+            if isinstance(instruction, Instr) else instruction
+            for instruction in p.body
+        ]
+        return p
 
     ############################################################################
     # Patch Instructions
@@ -234,8 +439,10 @@ class Compiler:
         raise Exception(f"Immediate value {value} does not fit in 64 bits")
 
     def patch_instr(self, i: instr) -> list[instr]:
-        # Rax is only used for after call
+        # Keep the scratch register out of the allocatable register set.
         match i:
+            case Instr(instr="movq", args=[source, destination]) if source == destination:
+                return []
             case Instr():
                 for a in i.args:
                     if type(a) is Immediate:
@@ -248,17 +455,16 @@ class Compiler:
                             return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
-                        scratch = Reg("rcx") if destination == Reg("rax") else Reg("rax")
                         return [
-                            Instr("movq", [Immediate(value), scratch]),
-                            Instr(i.instr, [scratch, destination]),
+                            Instr("movq", [Immediate(value), SCRATCH_REGISTER]),
+                            Instr(i.instr, [SCRATCH_REGISTER, destination]),
                         ]
 
                     case [source, destination] \
                             if is_memory_arg(source) and is_memory_arg(destination):
                         return [
-                            Instr("movq", [source, Reg("rax")]),
-                            Instr(i.instr, [Reg("rax"), destination]),
+                            Instr("movq", [source, SCRATCH_REGISTER]),
+                            Instr(i.instr, [SCRATCH_REGISTER, destination]),
                         ]
         return [i]
 
@@ -275,6 +481,7 @@ class Compiler:
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
+        assert isinstance(p.body, list)
         stack_space = 0
         for i in p.body:
             match i:
@@ -283,23 +490,32 @@ class Compiler:
                         match a:
                             case Deref() if a.reg == "rbp" and a.offset < 0:
                                 stack_space = max(stack_space, -a.offset)
+        saved_registers = [
+            (register, Deref("rbp", -8 * (index + 1)))
+            for index, register in enumerate(CALLEE_SAVED_REGISTERS)
+            if any(
+                isinstance(instruction, Instr) and register in instruction.args
+                for instruction in p.body
+            )
+        ]
+        for _, slot in saved_registers:
+            stack_space = max(stack_space, -slot.offset)
         stack_space = (stack_space + 15) // 16 * 16
 
         prologue = [
             Instr("pushq", [Reg("rbp")]),
             Instr("movq", [Reg("rsp"), Reg("rbp")]),
             Instr("subq", [Immediate(stack_space), Reg("rsp")]),
-        ]
+        ] + [Instr("movq", [register, slot]) for register, slot in saved_registers]
         conclusion = [
+            Instr("movq", [slot, register])
+            for register, slot in reversed(saved_registers)
+        ] + [
             Instr("movq", [Reg("rbp"), Reg("rsp")]),
             Instr("movq", [Immediate(0), Reg("rax")]),
             Instr("popq", [Reg("rbp")]),
             Instr("retq", []),
         ]
-
-        assert type(p.body) is list, (
-            "prelude_and_conclusion expects a flat instruction list"
-        )
 
         p.body = prologue + p.body + conclusion
 
@@ -310,8 +526,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("output", nargs="?")
+    parser.add_argument("--debug", action="store_true", help="print instructions and live-after sets")
+    parser.add_argument(
+        "--registers-cap", type=int, default=len(AVAILABLE_REGISTERS),
+        help=f"maximum allocatable registers (0-{len(AVAILABLE_REGISTERS)})",
+    )
     add_arguments(parser)
     args = parser.parse_args()
+    if not 0 <= args.registers_cap <= len(AVAILABLE_REGISTERS):
+        parser.error(f"--registers-cap must be between 0 and {len(AVAILABLE_REGISTERS)}")
 
     with open(args.input, "r") as file:
         module = ast.parse(file.read())
@@ -322,9 +545,11 @@ def main():
     checkpoint(args, "remove_complex_operands", simplified)
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
-    assigned_homes = compiler.assign_homes(instruction_list)
-    checkpoint(args, "assign_homes", assigned_homes)
-    patched_instructions = compiler.patch_instructions(assigned_homes)
+    allocated = compiler.allocate_registers(
+        instruction_list, registers_cap=args.registers_cap, debug=args.debug
+    )
+    checkpoint(args, "allocate_registers", allocated)
+    patched_instructions = compiler.patch_instructions(allocated)
     checkpoint(args, "patch_instructions", patched_instructions)
     added_prelude_conclusion = compiler.prelude_and_conclusion(patched_instructions)
     checkpoint(args, "prelude_and_conclusion", added_prelude_conclusion)

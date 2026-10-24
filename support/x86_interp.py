@@ -815,7 +815,7 @@ def interp_x86(prog: Program | ast.Module, **kwargs) -> list[int] | None:
 # finished program, and a --interp-after PASS that runs an intermediate one.
 # They live here so that there is one implementation rather than five.
 
-PASSES = ['remove_complex_operands', 'select_instructions', 'assign_homes', 'allocate_registers', 'patch_instructions',
+PASSES = ['remove_complex_operands', 'select_instructions', 'allocate_registers', 'patch_instructions',
           'prelude_and_conclusion']
 
 

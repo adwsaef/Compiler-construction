@@ -8,6 +8,10 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPILER = ROOT / "compiler" / "compile.py"
 RUNTIME = ROOT / "support" / "runtime.c"
 TESTS = Path(__file__).resolve().parent
+REGISTER_MODES = (
+    ("uncapped", ()),
+    ("cap 1", ("--registers-cap", "1")),
+)
 
 
 def run(command, input_text=""):
@@ -33,45 +37,55 @@ def run_good(source):
         if source.with_suffix(".in").exists() else ""
     expected = source.with_suffix(".out").read_text()
 
-    interpreted = run([sys.executable, str(COMPILER), str(source), "--interp"],
-                      input_text)
-    check_output(f"{source.name} interpreter", interpreted, expected)
-
-    with tempfile.TemporaryDirectory() as directory:
-        directory = Path(directory)
-        assembly = directory / f"{source.stem}.s"
-        executable = directory / source.stem
-
-        compiled = run([sys.executable, str(COMPILER), str(source), str(assembly)])
-        assert compiled.returncode == 0, (
-            f"{source.name} compilation failed:\n{compiled.stderr}"
+    for mode, options in REGISTER_MODES:
+        interpreted = run(
+            [sys.executable, str(COMPILER), str(source), *options, "--interp"],
+            input_text,
         )
+        check_output(f"{source.name} {mode} interpreter", interpreted, expected)
 
-        linked = run(["gcc", str(assembly), str(RUNTIME), "-o", str(executable)])
-        assert linked.returncode == 0, (
-            f"{source.name} linking failed:\n{linked.stderr}"
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            assembly = directory / f"{source.stem}.s"
+            executable = directory / source.stem
 
-        native = run([str(executable)], input_text)
-        check_output(f"{source.name} native", native, expected)
+            compiled = run([
+                sys.executable, str(COMPILER), str(source), str(assembly), *options
+            ])
+            assert compiled.returncode == 0, (
+                f"{source.name} {mode} compilation failed:\n{compiled.stderr}"
+            )
 
-    print(f"PASS {source.name}: interpreter + native")
+            linked = run(["gcc", str(assembly), str(RUNTIME), "-o", str(executable)])
+            assert linked.returncode == 0, (
+                f"{source.name} {mode} linking failed:\n{linked.stderr}"
+            )
+
+            native = run([str(executable)], input_text)
+            check_output(f"{source.name} {mode} native", native, expected)
+
+        print(f"PASS {source.name} {mode}: interpreter + native")
 
 
 def run_bad(source):
-    interpreted = run([sys.executable, str(COMPILER), str(source), "--interp"])
-    assert interpreted.returncode != 0, (
-        f"{source.name} was accepted by the interpreter"
-    )
-
-    with tempfile.TemporaryDirectory() as directory:
-        assembly = Path(directory) / f"{source.stem}.s"
-        compiled = run([sys.executable, str(COMPILER), str(source), str(assembly)])
-        assert compiled.returncode != 0, (
-            f"{source.name} was accepted by the compiler"
+    for mode, options in REGISTER_MODES:
+        interpreted = run([
+            sys.executable, str(COMPILER), str(source), *options, "--interp"
+        ])
+        assert interpreted.returncode != 0, (
+            f"{source.name} {mode} was accepted by the interpreter"
         )
 
-    print(f"PASS {source.name}: rejected")
+        with tempfile.TemporaryDirectory() as directory:
+            assembly = Path(directory) / f"{source.stem}.s"
+            compiled = run([
+                sys.executable, str(COMPILER), str(source), str(assembly), *options
+            ])
+            assert compiled.returncode != 0, (
+                f"{source.name} {mode} was accepted by the compiler"
+            )
+
+        print(f"PASS {source.name} {mode}: rejected")
 
 
 def main():
