@@ -13,6 +13,17 @@ from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[impo
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
 
+ARGUMENT_REGISTERS = tuple(Reg(name) for name in ("rdi", "rsi", "rdx", "rcx", "r8", "r9"))
+CALLER_SAVED_REGISTERS = tuple(
+    Reg(name) for name in ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11")
+)
+CALLEE_SAVED_REGISTERS = tuple(Reg(name) for name in ("rbx", "r12", "r13", "r14", "r15"))
+SCRATCH_REGISTER = Reg("r11")
+AVAILABLE_REGISTERS = CALLEE_SAVED_REGISTERS + tuple(
+    register for register in CALLER_SAVED_REGISTERS
+    if register not in (Reg("rax"), SCRATCH_REGISTER)
+)
+
 
 class Compiler:
 
@@ -189,54 +200,64 @@ class Compiler:
     # Register Allocation
     ############################################################################
 
+    def instruction_read(self, instruction: instr) -> set[arg]:
+        match instruction:
+            case Callq(num_args=arity):
+                return set(ARGUMENT_REGISTERS[:arity])
+            case Instr(instr="movq", args=[source, _]):
+                return {source} if isinstance(source, (Variable, Reg, Deref)) else set()
+            case Instr(
+                instr="addq" | "subq" | "imulq",
+                args=[source, destination],
+            ):
+                return {
+                    operand for operand in (source, destination)
+                    if isinstance(operand, (Variable, Reg, Deref))
+                }
+            case Instr(instr="negq", args=[destination]):
+                return {destination} if isinstance(destination, (Variable, Reg, Deref)) else set()
+            case _:
+                raise ValueError(f"Reads are not defined for {instruction}")
+
+    def instruction_write(self, instruction: instr) -> set[arg]:
+        match instruction:
+            case Callq():
+                return set(CALLER_SAVED_REGISTERS)
+            case Instr(
+                instr="movq" | "addq" | "subq" | "imulq",
+                args=[_, destination],
+            ) | Instr(instr="negq", args=[destination]):
+                return {destination} if isinstance(destination, (Variable, Reg, Deref)) else set()
+            case _:
+                raise ValueError(f"Writes are not defined for {instruction}")
+
     def uncover_live(self, p: X86Program) -> dict[int, set[arg]]:
         assert isinstance(p.body, list)
-        argument_registers: tuple[arg, ...] = tuple(
-            Reg(name) for name in ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
-        )
-        caller_saved: set[arg] = set(argument_registers)
-        caller_saved.update((Reg("rax"), Reg("r10"), Reg("r11")))
-
-        def locations(*operands: arg) -> set[arg]:
-            return {
-                operand for operand in operands
-                if isinstance(operand, (Variable, Reg, Deref))
-            }
-
-        def read_write(i: instr) -> tuple[set[arg], set[arg]]:
-            match i:
-                case Callq(num_args=arity):
-                    return set(argument_registers[:arity]), caller_saved
-                case Instr("movq", [source, destination]):
-                    return locations(source), locations(destination)
-                case Instr("addq" | "subq" | "imulq", [source, destination]):
-                    return locations(source, destination), locations(destination)
-                case Instr("negq", [destination]):
-                    return locations(destination), locations(destination)
-                case _:
-                    raise ValueError(f"Liveness is not defined for {i}")
-
         live: set[arg] = set()
         live_after: dict[int, set[arg]] = {}
         for index in reversed(range(len(p.body))):
             live_after[index] = live.copy()
-            reads, writes = read_write(p.body[index])
+            reads = self.instruction_read(p.body[index])
+            writes = self.instruction_write(p.body[index])
             live = (live - writes) | reads
         return live_after
 
     def debug_print_live(
-        self, live_instructions: dict[int, tuple[instr, set[arg]]]
+        self,
+        p: X86Program,
+        live_after: dict[int, set[arg]],
+        edges_by_index: dict[int, set[tuple[arg, arg]]],
     ) -> None:
+        assert isinstance(p.body, list)
         rows: list[tuple[str, str, str]] = []
-        for index in sorted(live_instructions):
-            instruction, live_after = live_instructions[index]
-            _, edges = self.instruction_interference(instruction, live_after)
+        for index, instruction in enumerate(p.body):
             instruction_text = str(instruction).strip()
-            live_text = "{" + ", ".join(sorted(map(str, live_after))) + "}"
+            live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
             edge_text = ", ".join(
                 f"{destination}-{neighbor}"
                 for destination, neighbor in sorted(
-                    edges, key=lambda edge: (str(edge[0]), str(edge[1]))
+                    edges_by_index[index],
+                    key=lambda edge: (str(edge[0]), str(edge[1])),
                 )
             ) or "--"
             rows.append((instruction_text, live_text, edge_text))
@@ -250,58 +271,57 @@ class Compiler:
             f"{'live-after':<{live_width}}  edges added",
             file=sys.stderr,
         )
-        for instruction, live, edges in rows:
+        for instruction_text, live_text, edge_text in rows:
             print(
-                f"{instruction:<{instruction_width}}  "
-                f"{live:<{live_width}}  {edges}",
+                f"{instruction_text:<{instruction_width}}  "
+                f"{live_text:<{live_width}}  {edge_text}",
                 file=sys.stderr,
             )
 
-    def instruction_interference(
-        self, instruction: instr, live_after: set[arg]
-    ) -> tuple[set[arg], set[tuple[arg, arg]]]:
-        move_source: arg | None = None
-        match instruction:
-            case Callq():
-                writes: set[arg] = {
-                    Reg(name) for name in
-                    ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11")
-                }
-            case Instr("movq", [source, destination]):
-                writes = {destination}
-                move_source = source
-            case Instr("addq" | "subq" | "imulq", [_, destination]):
-                writes = {destination}
-            case Instr("negq", [destination]):
-                writes = {destination}
-            case _:
-                raise ValueError(f"Interference is not defined for {instruction}")
-
-        edges: set[tuple[arg, arg]] = {
-            (destination, neighbor)
-            for destination in writes if isinstance(destination, (Variable, Reg))
-            for neighbor in live_after if isinstance(neighbor, (Variable, Reg))
-            and neighbor != destination and neighbor != move_source
-        }
-        return writes, edges
-
     def build_interface_graph(
-        self, live_instructions: dict[int, tuple[instr, set[arg]]]
-    ) -> dict[arg, set[arg]]:
+        self,
+        p: X86Program,
+        live_after: dict[int, set[arg]],
+    ) -> tuple[dict[arg, set[arg]], dict[int, set[tuple[arg, arg]]]]:
         """Connect each written location to the locations live after it."""
-        graph: dict[arg, set[arg]] = {}
-        for index in sorted(live_instructions):
-            instruction, live_after = live_instructions[index]
-            writes, edges = self.instruction_interference(instruction, live_after)
+        assert isinstance(p.body, list)
+        writes_by_index = [self.instruction_write(i) for i in p.body]
+        locations: set[arg] = set()
+        for after in live_after.values():
+            locations.update(after)
+        for writes in writes_by_index:
+            locations.update(writes)
+        for instruction in p.body:
+            if isinstance(instruction, Instr):
+                locations.update(
+                    operand for operand in instruction.args
+                    if isinstance(operand, Variable)
+                )
+        graph: dict[arg, set[arg]] = {
+            location: set()
+            for location in locations
+            if isinstance(location, (Variable, Reg))
+        }
+        edges_by_index: dict[int, set[tuple[arg, arg]]] = {}
+        for index, instruction in enumerate(p.body):
+            writes = writes_by_index[index]
 
-            for location in live_after | writes:
-                if isinstance(location, (Variable, Reg)):
-                    graph.setdefault(location, set())
-
+            match instruction:
+                case Instr(instr="movq", args=[source, _]):
+                    neighbors = live_after[index] - {source}
+                case _:
+                    neighbors = live_after[index]
+            edges: set[tuple[arg, arg]] = {
+                (destination, neighbor)
+                for destination in writes if isinstance(destination, (Variable, Reg))
+                for neighbor in neighbors if isinstance(neighbor, (Variable, Reg))
+                and neighbor != destination
+            }
             for destination, neighbor in edges:
                 graph[destination].add(neighbor)
                 graph[neighbor].add(destination)
-        return graph
+            edges_by_index[index] = edges
+        return graph, edges_by_index
 
     def color_graph(
         self, graph: dict[arg, set[arg]], colors: Sequence[int],
@@ -327,25 +347,79 @@ class Compiler:
             uncolored.remove(vertex)
         return color
 
-    def allocate_registers(self, p: X86Program, debug: bool = False) -> X86Program:
-        live_after = self.uncover_live(p)
+    def allocate_registers(
+        self,
+        p: X86Program,
+        registers_cap: int = len(AVAILABLE_REGISTERS),
+        debug: bool = False,
+    ) -> X86Program:
+        """Replace variables with up to registers_cap registers or stack slots."""
+        if not 0 <= registers_cap <= len(AVAILABLE_REGISTERS):
+            raise ValueError(
+                f"registers_cap must be between 0 and {len(AVAILABLE_REGISTERS)}"
+            )
         assert isinstance(p.body, list)
-        live_instructions = {
-            index: (instruction, live_after[index])
-            for index, instruction in enumerate(p.body)
+        defined: set[arg] = set()
+        for instruction in p.body:
+            unassigned = {
+                location for location in self.instruction_read(instruction)
+                if isinstance(location, Variable) and location not in defined
+            }
+            if unassigned:
+                names = ", ".join(sorted(str(location) for location in unassigned))
+                raise ValueError(f"Variable read before assignment: {names}")
+            defined.update(
+                location for location in self.instruction_write(instruction)
+                if isinstance(location, Variable)
+            )
+        live_after = self.uncover_live(p)
+        graph, edges_by_index = self.build_interface_graph(p, live_after)
+
+        fixed_registers = (
+            Reg("rax"), SCRATCH_REGISTER, Reg("rbp"), Reg("rsp")
+        ) + AVAILABLE_REGISTERS
+        register_colors = {
+            register: index for index, register in enumerate(fixed_registers)
         }
-        graph = self.build_interface_graph(live_instructions)
-        physical_registers = tuple(map(Reg, (
-            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9",
-            "r10", "r11", "r12", "r13", "r14", "r15",
-        )))
         precolored: dict[arg, int] = {
-            register: index for index, register in enumerate(physical_registers)
-            if register in graph
+            register: register_colors[register]
+            for register in graph if isinstance(register, Reg)
         }
-        self.color_graph(graph, range(len(physical_registers) + len(graph)), precolored)
+        spill_start = len(fixed_registers)
+        colors = [
+            register_colors[register]
+            for register in AVAILABLE_REGISTERS[:registers_cap]
+        ] + list(range(spill_start, spill_start + len(graph)))
+        coloring = self.color_graph(graph, colors, precolored)
+        spill_colors = sorted({
+            coloring[location] for location in graph
+            if isinstance(location, Variable) and coloring[location] >= spill_start
+        })
+        spill_homes = {
+            color: Deref("rbp", -8 * (len(CALLEE_SAVED_REGISTERS) + slot))
+            for slot, color in enumerate(spill_colors, start=1)
+        }
+        homes: dict[Variable, arg] = {
+            location: (
+                fixed_registers[coloring[location]]
+                if coloring[location] < spill_start
+                else spill_homes[coloring[location]]
+            )
+            for location in graph if isinstance(location, Variable)
+        }
         if debug:
-            self.debug_print_live(live_instructions)
+            self.debug_print_live(p, live_after, edges_by_index)
+        p.body = [
+            Instr(
+                instruction.instr,
+                [
+                    homes[operand] if isinstance(operand, Variable) else operand
+                    for operand in instruction.args
+                ],
+            )
+            if isinstance(instruction, Instr) else instruction
+            for instruction in p.body
+        ]
         return p
 
     ############################################################################
@@ -359,8 +433,10 @@ class Compiler:
         raise Exception(f"Immediate value {value} does not fit in 64 bits")
 
     def patch_instr(self, i: instr) -> list[instr]:
-        # Rax is only used for after call
+        # Keep the scratch register out of the allocatable register set.
         match i:
+            case Instr(instr="movq", args=[source, destination]) if source == destination:
+                return []
             case Instr():
                 for a in i.args:
                     if type(a) is Immediate:
@@ -374,15 +450,15 @@ class Compiler:
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
                         return [
-                            Instr("movq", [Immediate(value),  Reg("rax")]),
-                            Instr(i.instr, [Reg("rax"), destination]),
+                            Instr("movq", [Immediate(value), SCRATCH_REGISTER]),
+                            Instr(i.instr, [SCRATCH_REGISTER, destination]),
                         ]
 
                     case [source, destination] \
                             if is_memory_arg(source) and is_memory_arg(destination):
                         return [
-                            Instr("movq", [source, Reg("rax")]),
-                            Instr(i.instr, [Reg("rax"), destination]),
+                            Instr("movq", [source, SCRATCH_REGISTER]),
+                            Instr(i.instr, [SCRATCH_REGISTER, destination]),
                         ]
         return [i]
 
@@ -399,6 +475,7 @@ class Compiler:
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
+        assert isinstance(p.body, list)
         stack_space = 0
         for i in p.body:
             match i:
@@ -407,23 +484,32 @@ class Compiler:
                         match a:
                             case Deref() if a.reg == "rbp" and a.offset < 0:
                                 stack_space = max(stack_space, -a.offset)
+        saved_registers = [
+            (register, Deref("rbp", -8 * (index + 1)))
+            for index, register in enumerate(CALLEE_SAVED_REGISTERS)
+            if any(
+                isinstance(instruction, Instr) and register in instruction.args
+                for instruction in p.body
+            )
+        ]
+        for _, slot in saved_registers:
+            stack_space = max(stack_space, -slot.offset)
         stack_space = (stack_space + 15) // 16 * 16
 
         prologue = [
             Instr("pushq", [Reg("rbp")]),
             Instr("movq", [Reg("rsp"), Reg("rbp")]),
             Instr("subq", [Immediate(stack_space), Reg("rsp")]),
-        ]
+        ] + [Instr("movq", [register, slot]) for register, slot in saved_registers]
         conclusion = [
+            Instr("movq", [slot, register])
+            for register, slot in reversed(saved_registers)
+        ] + [
             Instr("movq", [Reg("rbp"), Reg("rsp")]),
             Instr("movq", [Immediate(0), Reg("rax")]),
             Instr("popq", [Reg("rbp")]),
             Instr("retq", []),
         ]
-
-        assert type(p.body) is list, (
-            "prelude_and_conclusion expects a flat instruction list"
-        )
 
         p.body = prologue + p.body + conclusion
 
@@ -435,8 +521,14 @@ def main():
     parser.add_argument("input")
     parser.add_argument("output", nargs="?")
     parser.add_argument("--debug", action="store_true", help="print instructions and live-after sets")
+    parser.add_argument(
+        "--registers-cap", type=int, default=len(AVAILABLE_REGISTERS),
+        help=f"maximum allocatable registers (0-{len(AVAILABLE_REGISTERS)})",
+    )
     add_arguments(parser)
     args = parser.parse_args()
+    if not 0 <= args.registers_cap <= len(AVAILABLE_REGISTERS):
+        parser.error(f"--registers-cap must be between 0 and {len(AVAILABLE_REGISTERS)}")
 
     with open(args.input, "r") as file:
         module = ast.parse(file.read())
@@ -447,7 +539,9 @@ def main():
     checkpoint(args, "remove_complex_operands", simplified)
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
-    allocated = compiler.allocate_registers(instruction_list, debug=args.debug)
+    allocated = compiler.allocate_registers(
+        instruction_list, registers_cap=args.registers_cap, debug=args.debug
+    )
     checkpoint(args, "allocate_registers", allocated)
     patched_instructions = compiler.patch_instructions(allocated)
     checkpoint(args, "patch_instructions", patched_instructions)

@@ -9,11 +9,9 @@ from x86_ast import Callq, Immediate, Instr, Reg, Variable, X86Program
 class UncoverLiveTests(unittest.TestCase):
     def graph_for(self, instructions):
         compiler = Compiler()
-        live_after = compiler.uncover_live(X86Program(instructions))
-        return compiler.build_interface_graph({
-            index: (instruction, live_after[index])
-            for index, instruction in enumerate(instructions)
-        })
+        program = X86Program(instructions)
+        graph, _ = compiler.build_interface_graph(program, compiler.uncover_live(program))
+        return graph
 
     def test_live_after_running_example(self):
         v, w, x, y, z = map(Variable, ("v", "w", "x", "y", "z"))
