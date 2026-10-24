@@ -13,15 +13,23 @@ from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[impo
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
 
-ARGUMENT_REGISTERS = tuple(Reg(name) for name in ("rdi", "rsi", "rdx", "rcx", "r8", "r9"))
-CALLER_SAVED_REGISTERS = tuple(
-    Reg(name) for name in ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11")
+SCRATCH_REGISTER = Reg("rax")
+ARGUMENT_REGISTERS = (
+    Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
 )
-CALLEE_SAVED_REGISTERS = tuple(Reg(name) for name in ("rbx", "r12", "r13", "r14", "r15"))
-SCRATCH_REGISTER = Reg("r11")
-AVAILABLE_REGISTERS = CALLEE_SAVED_REGISTERS + tuple(
-    register for register in CALLER_SAVED_REGISTERS
-    if register not in (Reg("rax"), SCRATCH_REGISTER)
+CALLEE_SAVED_REGISTERS = (
+    Reg("rbx"), Reg("r12"), Reg("r13"), Reg("r14"), Reg("r15"),
+)
+CALLER_SAVED_REGISTERS = (
+    SCRATCH_REGISTER, Reg("rcx"), Reg("rdx"), Reg("rsi"), Reg("rdi"),
+    Reg("r8"), Reg("r9"), Reg("r10"), Reg("r11"),
+)
+RESERVED_REGISTERS = (
+    Reg("rax"), Reg("rsp"), Reg("rbp"), Reg("r11"), Reg("r15"),
+)
+AVAILABLE_REGISTERS = tuple(
+    register for register in CALLEE_SAVED_REGISTERS + CALLER_SAVED_REGISTERS
+    if register not in RESERVED_REGISTERS
 )
 
 
@@ -180,9 +188,9 @@ class Compiler:
 
                         # Right arg is not immadiete, emitted imulq is correct.
                         return [
-                            Instr("movq", [left_arg, Reg("rax")]),
-                            Instr("imulq", [right_arg, Reg("rax")]),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
+                            Instr("movq", [left_arg, SCRATCH_REGISTER]),
+                            Instr("imulq", [right_arg, SCRATCH_REGISTER]),
+                            Instr("movq", [SCRATCH_REGISTER, Variable(lhs)]),
                         ]
                     case _:
                         raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
@@ -375,9 +383,7 @@ class Compiler:
         live_after = self.uncover_live(p)
         graph, edges_by_index = self.build_interface_graph(p, live_after)
 
-        fixed_registers = (
-            Reg("rax"), SCRATCH_REGISTER, Reg("rbp"), Reg("rsp")
-        ) + AVAILABLE_REGISTERS
+        fixed_registers = RESERVED_REGISTERS + AVAILABLE_REGISTERS
         register_colors = {
             register: index for index, register in enumerate(fixed_registers)
         }
