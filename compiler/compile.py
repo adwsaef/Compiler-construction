@@ -208,22 +208,28 @@ class Compiler:
     # Register Allocation
     ############################################################################
 
+    def operand_locations(self, operand: arg) -> set[arg]:
+        match operand:
+            case Variable() | Reg():
+                return {operand}
+            case Immediate():
+                return set()
+            case _:
+                raise ValueError(f"Unexpected register allocation operand: {operand}")
+
     def instruction_read(self, instruction: instr) -> set[arg]:
         match instruction:
             case Callq(num_args=arity):
                 return set(ARGUMENT_REGISTERS[:arity])
             case Instr(instr="movq", args=[source, _]):
-                return {source} if isinstance(source, (Variable, Reg, Deref)) else set()
+                return self.operand_locations(source)
             case Instr(
                 instr="addq" | "subq" | "imulq",
                 args=[source, destination],
             ):
-                return {
-                    operand for operand in (source, destination)
-                    if isinstance(operand, (Variable, Reg, Deref))
-                }
+                return self.operand_locations(source) | self.operand_locations(destination)
             case Instr(instr="negq", args=[destination]):
-                return {destination} if isinstance(destination, (Variable, Reg, Deref)) else set()
+                return self.operand_locations(destination)
             case _:
                 raise ValueError(f"Reads are not defined for {instruction}")
 
@@ -235,7 +241,7 @@ class Compiler:
                 instr="movq" | "addq" | "subq" | "imulq",
                 args=[_, destination],
             ) | Instr(instr="negq", args=[destination]):
-                return {destination} if isinstance(destination, (Variable, Reg, Deref)) else set()
+                return self.operand_locations(destination)
             case _:
                 raise ValueError(f"Writes are not defined for {instruction}")
 
@@ -249,6 +255,45 @@ class Compiler:
             writes = self.instruction_write(p.body[index])
             live = (live - writes) | reads
         return live_after
+
+    def instruction_edges(
+        self,
+        instruction: instr,
+        live_after: set[arg],
+        writes: set[arg],
+    ) -> set[tuple[arg, arg]]:
+        match instruction:
+            case Instr(instr="movq", args=[source, _]):
+                neighbors = live_after - {source}
+            case _:
+                neighbors = live_after
+        return {
+            (destination, neighbor)
+            for destination in writes
+            for neighbor in neighbors
+            if neighbor != destination
+        }
+
+    def build_interface_graph(
+        self,
+        p: X86Program,
+        live_after: dict[int, set[arg]],
+    ) -> tuple[dict[arg, set[arg]], dict[int, set[tuple[arg, arg]]]]:
+        assert isinstance(p.body, list)
+        graph: dict[arg, set[arg]] = {}
+        edges_by_index: dict[int, set[tuple[arg, arg]]] = {}
+        for index, instruction in enumerate(p.body):
+            writes = self.instruction_write(instruction)
+            for location in live_after[index] | writes:
+                graph.setdefault(location, set())
+
+            edges = self.instruction_edges(instruction, live_after[index], writes)
+            for destination, neighbor in edges:
+                graph[destination].add(neighbor)
+                graph[neighbor].add(destination)
+            edges_by_index[index] = edges
+        return graph, edges_by_index
+
 
     def debug_print_live(
         self,
@@ -285,51 +330,6 @@ class Compiler:
                 f"{live_text:<{live_width}}  {edge_text}",
                 file=sys.stderr,
             )
-
-    def build_interface_graph(
-        self,
-        p: X86Program,
-        live_after: dict[int, set[arg]],
-    ) -> tuple[dict[arg, set[arg]], dict[int, set[tuple[arg, arg]]]]:
-        """Connect each written location to the locations live after it."""
-        assert isinstance(p.body, list)
-        writes_by_index = [self.instruction_write(i) for i in p.body]
-        locations: set[arg] = set()
-        for after in live_after.values():
-            locations.update(after)
-        for writes in writes_by_index:
-            locations.update(writes)
-        for instruction in p.body:
-            if isinstance(instruction, Instr):
-                locations.update(
-                    operand for operand in instruction.args
-                    if isinstance(operand, Variable)
-                )
-        graph: dict[arg, set[arg]] = {
-            location: set()
-            for location in locations
-            if isinstance(location, (Variable, Reg))
-        }
-        edges_by_index: dict[int, set[tuple[arg, arg]]] = {}
-        for index, instruction in enumerate(p.body):
-            writes = writes_by_index[index]
-
-            match instruction:
-                case Instr(instr="movq", args=[source, _]):
-                    neighbors = live_after[index] - {source}
-                case _:
-                    neighbors = live_after[index]
-            edges: set[tuple[arg, arg]] = {
-                (destination, neighbor)
-                for destination in writes if isinstance(destination, (Variable, Reg))
-                for neighbor in neighbors if isinstance(neighbor, (Variable, Reg))
-                and neighbor != destination
-            }
-            for destination, neighbor in edges:
-                graph[destination].add(neighbor)
-                graph[neighbor].add(destination)
-            edges_by_index[index] = edges
-        return graph, edges_by_index
 
     def color_graph(
         self, graph: dict[arg, set[arg]], colors: Sequence[int],
