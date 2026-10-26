@@ -475,23 +475,22 @@ class Compiler:
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
         assert isinstance(p.body, list)
         stack_space = 0
-        for i in p.body:
-            match i:
-                case Instr():
-                    for a in i.args:
-                        match a:
-                            case Deref() if a.reg == "rbp" and a.offset < 0:
-                                stack_space = max(stack_space, -a.offset)
-        saved_registers = [
-            (register, Deref("rbp", -8 * (index + 1)))
-            for index, register in enumerate(CALLEE_SAVED_REGISTERS)
-            if any(
-                isinstance(instruction, Instr) and register in instruction.args
-                for instruction in p.body
-            )
-        ]
-        for _, slot in saved_registers:
-            stack_space = max(stack_space, -slot.offset)
+        used_callee_saved: set[Reg] = set()
+        for instruction in p.body:
+            if not isinstance(instruction, Instr):
+                continue
+            for operand in instruction.args:
+                if isinstance(operand, Deref) and operand.reg == "rbp":
+                    stack_space = max(stack_space, -operand.offset)
+                elif isinstance(operand, Reg) and operand in CALLEE_SAVED_REGISTERS:
+                    used_callee_saved.add(operand)
+
+        saved_registers: list[tuple[Reg, Deref]] = []
+        for index, register in enumerate(CALLEE_SAVED_REGISTERS):
+            if register in used_callee_saved:
+                slot = Deref("rbp", -8 * (index + 1))
+                saved_registers.append((register, slot))
+                stack_space = max(stack_space, -slot.offset)
         stack_space = (stack_space + 15) // 16 * 16
 
         prologue = [
