@@ -3,7 +3,6 @@
 import ast
 import argparse
 import sys
-from collections.abc import Sequence
 
 from ast import (Constant, expr, stmt, Module, Name)
 from ast_utils import generate_name  # type: ignore[import-untyped]
@@ -24,13 +23,15 @@ CALLER_SAVED_REGISTERS = (
     SCRATCH_REGISTER, Reg("rcx"), Reg("rdx"), Reg("rsi"), Reg("rdi"),
     Reg("r8"), Reg("r9"), Reg("r10"), Reg("r11"),
 )
-RESERVED_REGISTERS = (
-    Reg("rax"), Reg("rsp"), Reg("rbp"), Reg("r11"), Reg("r15"),
-)
-AVAILABLE_REGISTERS = tuple(
-    register for register in CALLEE_SAVED_REGISTERS + CALLER_SAVED_REGISTERS
-    if register not in RESERVED_REGISTERS
-)
+COLOR_TO_REGISTER = {
+    0: Reg("rcx"), 1: Reg("rdx"), 2: Reg("rsi"), 3: Reg("rdi"),
+    4: Reg("r8"), 5: Reg("r9"), 6: Reg("r10"),
+    7: Reg("rbx"), 8: Reg("r12"), 9: Reg("r13"), 10: Reg("r14"),
+    -1: SCRATCH_REGISTER, -2: Reg("rsp"), -3: Reg("rbp"),
+    -4: Reg("r11"), -5: Reg("r15"),
+}
+REGISTER_TO_COLOR = {register: color for color, register in COLOR_TO_REGISTER.items()}
+AVAILABLE_REGISTER_COUNT = sum(color >= 0 for color in COLOR_TO_REGISTER)
 
 
 class Compiler:
@@ -278,10 +279,9 @@ class Compiler:
         self,
         p: X86Program,
         live_after: dict[int, set[arg]],
-    ) -> tuple[dict[arg, set[arg]], dict[int, set[tuple[arg, arg]]]]:
+    ) -> dict[arg, set[arg]]:
         assert isinstance(p.body, list)
         graph: dict[arg, set[arg]] = {}
-        edges_by_index: dict[int, set[tuple[arg, arg]]] = {}
         for index, instruction in enumerate(p.body):
             writes = self.instruction_write(instruction)
             for location in live_after[index] | writes:
@@ -291,25 +291,32 @@ class Compiler:
             for destination, neighbor in edges:
                 graph[destination].add(neighbor)
                 graph[neighbor].add(destination)
-            edges_by_index[index] = edges
-        return graph, edges_by_index
+        return graph
 
 
     def debug_print_live(
         self,
         p: X86Program,
         live_after: dict[int, set[arg]],
-        edges_by_index: dict[int, set[tuple[arg, arg]]],
+        allocatable_registers: tuple[Reg, ...],
     ) -> None:
         assert isinstance(p.body, list)
+        print(
+            "Available for allocation: "
+            + ", ".join(map(str, allocatable_registers)),
+            file=sys.stderr,
+        )
         rows: list[tuple[str, str, str]] = []
         for index, instruction in enumerate(p.body):
             instruction_text = str(instruction).strip()
             live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
+            edges = self.instruction_edges(
+                instruction, live_after[index], self.instruction_write(instruction)
+            )
             edge_text = ", ".join(
                 f"{destination}-{neighbor}"
                 for destination, neighbor in sorted(
-                    edges_by_index[index],
+                    edges,
                     key=lambda edge: (str(edge[0]), str(edge[1])),
                 )
             ) or "--"
@@ -331,44 +338,9 @@ class Compiler:
                 file=sys.stderr,
             )
 
-    def color_graph(
-        self, graph: dict[arg, set[arg]], colors: Sequence[int],
-        precolored: dict[arg, int]
-    ) -> dict[arg, int]:
-        """Color a graph by highest saturation, using the first free color."""
-        color = precolored.copy()
-        uncolored = set(graph) - color.keys()
-        while uncolored:
-            vertex = max(
-                uncolored,
-                key=lambda v: (
-                    len({color[n] for n in graph[v] if n in color}),
-                    len(graph[v]),
-                    str(v),
-                ),
-            )
-            used = {color[n] for n in graph[vertex] if n in color}
-            available = next((c for c in colors if c not in used), None)
-            if available is None:
-                raise ValueError(f"No color available for {vertex}")
-            color[vertex] = available
-            uncolored.remove(vertex)
-        return color
-
-    def allocate_registers(
-        self,
-        p: X86Program,
-        registers_cap: int = len(AVAILABLE_REGISTERS),
-        debug: bool = False,
-    ) -> X86Program:
-        """Replace variables with up to registers_cap registers or stack slots."""
-        if not 0 <= registers_cap <= len(AVAILABLE_REGISTERS):
-            raise ValueError(
-                f"registers_cap must be between 0 and {len(AVAILABLE_REGISTERS)}"
-            )
-        assert isinstance(p.body, list)
+    def check_variables_defined(self, instructions: list[instr]) -> None:
         defined: set[arg] = set()
-        for instruction in p.body:
+        for instruction in instructions:
             unassigned = {
                 location for location in self.instruction_read(instruction)
                 if isinstance(location, Variable) and location not in defined
@@ -380,41 +352,61 @@ class Compiler:
                 location for location in self.instruction_write(instruction)
                 if isinstance(location, Variable)
             )
-        live_after = self.uncover_live(p)
-        graph, edges_by_index = self.build_interface_graph(p, live_after)
 
-        fixed_registers = RESERVED_REGISTERS + AVAILABLE_REGISTERS
-        register_colors = {
-            register: index for index, register in enumerate(fixed_registers)
-        }
-        precolored: dict[arg, int] = {
-            register: register_colors[register]
+    def color_graph(
+        self, graph: dict[arg, set[arg]], coloring: dict[arg, int]
+    ) -> None:
+        uncolored = set(graph) - coloring.keys()
+        while uncolored:
+            vertex = max(
+                uncolored,
+                key=lambda v: len({coloring[n] for n in graph[v] if n in coloring}),
+            )
+            used = {coloring[n] for n in graph[vertex] if n in coloring}
+            color = 0
+            while color in used:
+                color += 1
+            coloring[vertex] = color
+            uncolored.remove(vertex)
+
+    def allocate_registers(
+        self,
+        p: X86Program,
+        registers_cap: int = AVAILABLE_REGISTER_COUNT,
+        debug: bool = False,
+    ) -> X86Program:
+        if registers_cap < 1:
+            raise ValueError("registers_cap must be at least 1")
+        assert isinstance(p.body, list)
+        self.check_variables_defined(p.body)
+        live_after = self.uncover_live(p)
+        graph = self.build_interface_graph(p, live_after)
+
+        registers_cap = min(registers_cap, AVAILABLE_REGISTER_COUNT)
+        coloring: dict[arg, int] = {
+            register: REGISTER_TO_COLOR[register]
             for register in graph if isinstance(register, Reg)
         }
-        spill_start = len(fixed_registers)
-        colors = [
-            register_colors[register]
-            for register in AVAILABLE_REGISTERS[:registers_cap]
-        ] + list(range(spill_start, spill_start + len(graph)))
-        coloring = self.color_graph(graph, colors, precolored)
-        spill_colors = sorted({
-            coloring[location] for location in graph
-            if isinstance(location, Variable) and coloring[location] >= spill_start
-        })
-        spill_homes = {
-            color: Deref("rbp", -8 * (len(CALLEE_SAVED_REGISTERS) + slot))
-            for slot, color in enumerate(spill_colors, start=1)
-        }
-        homes: dict[Variable, arg] = {
-            location: (
-                fixed_registers[coloring[location]]
-                if coloring[location] < spill_start
-                else spill_homes[coloring[location]]
-            )
-            for location in graph if isinstance(location, Variable)
-        }
+        self.color_graph(graph, coloring)
+
+        stack_offsets: dict[int, int] = {}
+        homes: dict[Variable, arg] = {}
+        for location, color in coloring.items():
+            if not isinstance(location, Variable):
+                continue
+            if color < registers_cap:
+                homes[location] = COLOR_TO_REGISTER[color]
+            else:
+                if color not in stack_offsets:
+                    slot = len(stack_offsets) + 1
+                    stack_offsets[color] = -8 * (len(CALLEE_SAVED_REGISTERS) + slot)
+                homes[location] = Deref("rbp", stack_offsets[color])
+
         if debug:
-            self.debug_print_live(p, live_after, edges_by_index)
+            self.debug_print_live(
+                p, live_after,
+                tuple(COLOR_TO_REGISTER[color] for color in range(registers_cap)),
+            )
         p.body = [
             Instr(
                 instruction.instr,
@@ -528,13 +520,13 @@ def main():
     parser.add_argument("output", nargs="?")
     parser.add_argument("--debug", action="store_true", help="print instructions and live-after sets")
     parser.add_argument(
-        "--registers-cap", type=int, default=len(AVAILABLE_REGISTERS),
-        help=f"maximum allocatable registers (0-{len(AVAILABLE_REGISTERS)})",
+        "--registers-cap", type=int, default=AVAILABLE_REGISTER_COUNT,
+        help=f"number of allocatable registers (at least 1; {AVAILABLE_REGISTER_COUNT} available)",
     )
     add_arguments(parser)
     args = parser.parse_args()
-    if not 0 <= args.registers_cap <= len(AVAILABLE_REGISTERS):
-        parser.error(f"--registers-cap must be between 0 and {len(AVAILABLE_REGISTERS)}")
+    if args.registers_cap < 1:
+        parser.error("--registers-cap must be at least 1")
 
     with open(args.input, "r") as file:
         module = ast.parse(file.read())
