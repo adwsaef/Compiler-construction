@@ -261,8 +261,8 @@ class Compiler:
         self,
         instruction: instr,
         live_after: set[arg],
-        writes: set[arg],
     ) -> set[tuple[arg, arg]]:
+        writes = self.instruction_write(instruction)
         match instruction:
             case Instr(instr="movq", args=[source, _]):
                 neighbors = live_after - {source}
@@ -287,7 +287,7 @@ class Compiler:
             for location in live_after[index] | writes:
                 graph.setdefault(location, set())
 
-            edges = self.instruction_edges(instruction, live_after[index], writes)
+            edges = self.instruction_edges(instruction, live_after[index])
             for destination, neighbor in edges:
                 graph[destination].add(neighbor)
                 graph[neighbor].add(destination)
@@ -303,30 +303,43 @@ class Compiler:
         homes: dict[Variable, arg],
     ) -> None:
         assert isinstance(p.body, list)
+
         print(
             "Available for allocation: "
             + ", ".join(map(str, allocatable_registers)),
             file=sys.stderr,
         )
-        print("Instructions, live-after sets, and added edges:", file=sys.stderr)
+
+        rows: list[tuple[str, str, str]] = []
         for index, instruction in enumerate(p.body):
-            live_text = ", ".join(sorted(map(str, live_after[index])))
-            edges = self.instruction_edges(
-                instruction, live_after[index], self.instruction_write(instruction)
-            )
+            live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
+            edges = self.instruction_edges(instruction, live_after[index])
             edge_text = ", ".join(sorted(
                 f"{destination}-{neighbor}" for destination, neighbor in edges
             )) or "--"
+            rows.append((str(instruction).strip(), live_text, edge_text))
+
+        instruction_width = max([len("Instruction")] + [len(row[0]) for row in rows])
+        live_width = max([len("live-after")] + [len(row[1]) for row in rows])
+        print(file=sys.stderr)
+        print(
+            f"  {'Instruction':<{instruction_width}}  "
+            f"{'live-after':<{live_width}}  edges added",
+            file=sys.stderr,
+        )
+        for instruction_text, live_text, edge_text in rows:
             print(
-                f"  {str(instruction).strip()}  live-after={{{live_text}}}  "
-                f"edges={edge_text}",
+                f"  {instruction_text:<{instruction_width}}  "
+                f"{live_text:<{live_width}}  {edge_text}",
                 file=sys.stderr,
             )
 
+        print(file=sys.stderr)
         print("Colors and homes:", file=sys.stderr)
         for location in sorted(coloring, key=str):
             home = f" -> {homes[location]}" if isinstance(location, Variable) else ""
             print(f"  {location}: {coloring[location]}{home}", file=sys.stderr)
+        print(file=sys.stderr)
 
     def check_variables_defined(self, instructions: list[instr]) -> None:
         defined: set[arg] = set()
