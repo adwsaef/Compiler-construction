@@ -1,0 +1,6 @@
+x = input_int()
+unused = input_int()
+print(x)
+a = 5
+b = 6
+print(a + b)
