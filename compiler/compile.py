@@ -541,8 +541,6 @@ def main():
     )
     add_arguments(parser)
     args = parser.parse_args()
-    if args.registers_cap < 1:
-        parser.error("--registers-cap must be at least 1")
 
     with open(args.input, "r") as file:
         module = ast.parse(file.read())
