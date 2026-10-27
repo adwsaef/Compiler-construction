@@ -294,11 +294,13 @@ class Compiler:
         return graph
 
 
-    def debug_print_live(
+    def debug_register_allocation(
         self,
         p: X86Program,
         live_after: dict[int, set[arg]],
         allocatable_registers: tuple[Reg, ...],
+        coloring: dict[arg, int],
+        homes: dict[Variable, arg],
     ) -> None:
         assert isinstance(p.body, list)
         print(
@@ -306,37 +308,25 @@ class Compiler:
             + ", ".join(map(str, allocatable_registers)),
             file=sys.stderr,
         )
-        rows: list[tuple[str, str, str]] = []
+        print("Instructions, live-after sets, and added edges:", file=sys.stderr)
         for index, instruction in enumerate(p.body):
-            instruction_text = str(instruction).strip()
-            live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
+            live_text = ", ".join(sorted(map(str, live_after[index])))
             edges = self.instruction_edges(
                 instruction, live_after[index], self.instruction_write(instruction)
             )
-            edge_text = ", ".join(
-                f"{destination}-{neighbor}"
-                for destination, neighbor in sorted(
-                    edges,
-                    key=lambda edge: (str(edge[0]), str(edge[1])),
-                )
-            ) or "--"
-            rows.append((instruction_text, live_text, edge_text))
-
-        instruction_width = max((len(row[0]) for row in rows), default=0)
-        instruction_width = max(instruction_width, len("Instruction"))
-        live_width = max((len(row[1]) for row in rows), default=0)
-        live_width = max(live_width, len("live-after"))
-        print(
-            f"{'Instruction':<{instruction_width}}  "
-            f"{'live-after':<{live_width}}  edges added",
-            file=sys.stderr,
-        )
-        for instruction_text, live_text, edge_text in rows:
+            edge_text = ", ".join(sorted(
+                f"{destination}-{neighbor}" for destination, neighbor in edges
+            )) or "--"
             print(
-                f"{instruction_text:<{instruction_width}}  "
-                f"{live_text:<{live_width}}  {edge_text}",
+                f"  {str(instruction).strip()}  live-after={{{live_text}}}  "
+                f"edges={edge_text}",
                 file=sys.stderr,
             )
+
+        print("Colors and homes:", file=sys.stderr)
+        for location in sorted(coloring, key=str):
+            home = f" -> {homes[location]}" if isinstance(location, Variable) else ""
+            print(f"  {location}: {coloring[location]}{home}", file=sys.stderr)
 
     def check_variables_defined(self, instructions: list[instr]) -> None:
         defined: set[arg] = set()
@@ -373,7 +363,7 @@ class Compiler:
         self,
         p: X86Program,
         registers_cap: int = AVAILABLE_REGISTER_COUNT,
-        debug: bool = False,
+        debug_allocate_registers: bool = False,
     ) -> X86Program:
         if registers_cap < 1:
             raise ValueError("registers_cap must be at least 1")
@@ -389,8 +379,8 @@ class Compiler:
         }
         self.color_graph(graph, coloring)
 
-        stack_offsets: dict[int, int] = {}
         homes: dict[Variable, arg] = {}
+        stack_offsets: dict[int, int] = {}
         for location, color in coloring.items():
             if not isinstance(location, Variable):
                 continue
@@ -399,13 +389,14 @@ class Compiler:
             else:
                 if color not in stack_offsets:
                     slot = len(stack_offsets) + 1
-                    stack_offsets[color] = -8 * (len(CALLEE_SAVED_REGISTERS) + slot)
+                    stack_offsets[color] = -8 * slot
                 homes[location] = Deref("rbp", stack_offsets[color])
 
-        if debug:
-            self.debug_print_live(
+        if debug_allocate_registers:
+            self.debug_register_allocation(
                 p, live_after,
                 tuple(COLOR_TO_REGISTER[color] for color in range(registers_cap)),
+                coloring, homes,
             )
         p.body = [
             Instr(
@@ -472,41 +463,54 @@ class Compiler:
     # Prelude & Conclusion
     ############################################################################
 
+    def used_callee_saved_registers(self, instructions: list[instr]) -> set[Reg]:
+        return {
+            operand
+            for instruction in instructions if isinstance(instruction, Instr)
+            for operand in instruction.args
+            if isinstance(operand, Reg) and operand in CALLEE_SAVED_REGISTERS
+        }
+
+    def used_stack_size(self, instructions: list[instr]) -> int:
+        return max(
+            (
+                -operand.offset
+                for instruction in instructions if isinstance(instruction, Instr)
+                for operand in instruction.args
+                if isinstance(operand, Deref) and operand.reg == "rbp"
+            ),
+            default=0,
+        )
+
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
         assert isinstance(p.body, list)
-        stack_space = 0
-        used_callee_saved: set[Reg] = set()
-        for instruction in p.body:
-            if not isinstance(instruction, Instr):
-                continue
-            for operand in instruction.args:
-                if isinstance(operand, Deref) and operand.reg == "rbp":
-                    stack_space = max(stack_space, -operand.offset)
-                elif isinstance(operand, Reg) and operand in CALLEE_SAVED_REGISTERS:
-                    used_callee_saved.add(operand)
+        used_stack_bytes = self.used_stack_size(p.body)
 
-        saved_registers: list[tuple[Reg, Deref]] = []
-        for index, register in enumerate(CALLEE_SAVED_REGISTERS):
-            if register in used_callee_saved:
-                slot = Deref("rbp", -8 * (index + 1))
-                saved_registers.append((register, slot))
-                stack_space = max(stack_space, -slot.offset)
-        stack_space = (stack_space + 15) // 16 * 16
+        saved_registers = list(self.used_callee_saved_registers(p.body))
+        saved_register_bytes = 8 * len(saved_registers)
+        stack_adjustment = (
+            (used_stack_bytes + saved_register_bytes + 15) // 16 * 16
+            - saved_register_bytes
+        )
 
         prologue = [
             Instr("pushq", [Reg("rbp")]),
             Instr("movq", [Reg("rsp"), Reg("rbp")]),
-            Instr("subq", [Immediate(stack_space), Reg("rsp")]),
-        ] + [Instr("movq", [register, slot]) for register, slot in saved_registers]
-        conclusion = [
-            Instr("movq", [slot, register])
-            for register, slot in reversed(saved_registers)
-        ] + [
-            Instr("movq", [Reg("rbp"), Reg("rsp")]),
+        ]
+        if stack_adjustment:
+            prologue.append(Instr("subq", [Immediate(stack_adjustment), Reg("rsp")]))
+        prologue.extend(Instr("pushq", [register]) for register in saved_registers)
+
+        conclusion: list[instr] = [
+            Instr("popq", [register]) for register in reversed(saved_registers)
+        ]
+        if stack_adjustment:
+            conclusion.append(Instr("addq", [Immediate(stack_adjustment), Reg("rsp")]))
+        conclusion.extend([
             Instr("movq", [Immediate(0), Reg("rax")]),
             Instr("popq", [Reg("rbp")]),
             Instr("retq", []),
-        ]
+        ])
 
         p.body = prologue + p.body + conclusion
 
@@ -517,7 +521,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("output", nargs="?")
-    parser.add_argument("--debug", action="store_true", help="print instructions and live-after sets")
+    parser.add_argument("--debug-allocate-registers", action="store_true", help="print live-after sets, added edges, colors, and homes")
     parser.add_argument(
         "--registers-cap", type=int, default=AVAILABLE_REGISTER_COUNT,
         help=f"number of allocatable registers (at least 1; {AVAILABLE_REGISTER_COUNT} available)",
@@ -537,7 +541,8 @@ def main():
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
     allocated = compiler.allocate_registers(
-        instruction_list, registers_cap=args.registers_cap, debug=args.debug
+        instruction_list, registers_cap=args.registers_cap,
+        debug_allocate_registers=args.debug_allocate_registers,
     )
     checkpoint(args, "allocate_registers", allocated)
     patched_instructions = compiler.patch_instructions(allocated)

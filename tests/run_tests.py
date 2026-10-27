@@ -11,6 +11,7 @@ TESTS = Path(__file__).resolve().parent
 REGISTER_MODES = (
     ("uncapped", ()),
     ("cap 1", ("--registers-cap", "1")),
+    ("cap 8", ("--registers-cap", "8")),
 )
 
 
