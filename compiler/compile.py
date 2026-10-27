@@ -108,6 +108,13 @@ class Compiler:
     # Select Instructions
     ############################################################################
 
+    def immediate_size(self, value: int) -> int:
+        if -(2 ** 31) <= value < 2 ** 31:
+            return 32
+        if -(2 ** 63) <= value < 2 ** 63:
+            return 64
+        raise Exception(f"Immediate value {value} does not fit in 64 bits")
+
     # The expression e passed to select_arg should furthermore be an atom.
     # (But there is no type for atoms, so the type of e is given as expr.)
     def select_arg(self, e: expr) -> arg:
@@ -115,6 +122,7 @@ class Compiler:
             case Constant(value):
                 match value:
                     case int():
+                        self.immediate_size(value)
                         return Immediate(value)
                     case _:
                         raise Exception(f"Only integers allowed {e}")
@@ -180,8 +188,10 @@ class Compiler:
                         left_arg = self.select_arg(left)
                         right_arg = self.select_arg(right)
                         if isinstance(left_arg, Immediate) and isinstance(right_arg, Immediate):
+                            product = left_arg.value * right_arg.value
+                            self.immediate_size(product)
                             return [
-                                Instr("movq", [Immediate(left_arg.value * right_arg.value), Variable(lhs)])
+                                Instr("movq", [Immediate(product), Variable(lhs)])
                             ]
 
                         if isinstance(right_arg, Immediate):
@@ -426,13 +436,6 @@ class Compiler:
     ############################################################################
     # Patch Instructions
     ############################################################################
-    def immediate_size(self, value: int) -> int:
-        if -(2 ** 31) <= value < 2 ** 31:
-            return 32
-        if -(2 ** 63) <= value < 2 ** 63:
-            return 64
-        raise Exception(f"Immediate value {value} does not fit in 64 bits")
-
     def patch_instr(self, i: instr) -> list[instr]:
         # Keep the scratch register out of the allocatable register set.
         match i:
