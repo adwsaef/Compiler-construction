@@ -401,8 +401,7 @@ class Compiler:
                 homes[location] = COLOR_TO_REGISTER[color]
             else:
                 if color not in stack_offsets:
-                    slot = len(stack_offsets) + 1
-                    stack_offsets[color] = -8 * slot
+                    stack_offsets[color] = -8 * (len(stack_offsets) + 1)
                 homes[location] = Deref("rbp", stack_offsets[color])
 
         if debug_allocate_registers:
