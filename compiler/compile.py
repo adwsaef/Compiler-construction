@@ -285,7 +285,7 @@ class Compiler:
             if neighbor != destination
         }
 
-    def build_interface_graph(
+    def build_interference_graph(
         self,
         p: X86Program,
         live_after: dict[int, set[arg]],
@@ -393,7 +393,7 @@ class Compiler:
         assert isinstance(p.body, list)
         self.check_variables_defined(p.body)
         live_after = self.uncover_live(p)
-        graph = self.build_interface_graph(p, live_after)
+        graph = self.build_interference_graph(p, live_after)
 
         registers_cap = min(registers_cap, AVAILABLE_REGISTER_COUNT)
         coloring: dict[arg, int] = {
