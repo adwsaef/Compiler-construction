@@ -4,7 +4,7 @@ import ast
 import argparse
 import sys
 
-from ast import (Constant, expr, stmt, Module, Name)
+from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
@@ -36,6 +36,65 @@ AVAILABLE_REGISTER_COUNT = sum(color >= 0 for color in COLOR_TO_REGISTER)
 
 class Compiler:
 
+    ############################################################################
+    # Shrink
+    ############################################################################
+
+    def shrink_exp(self, e: expr) -> expr:
+        print(f"Shrinking {e}", file=sys.stderr)
+        match e:
+            case ast.BoolOp(ast.And, values):
+                raise Exception("Unimplemented")
+                #if not values:
+                #    return ast.Constant(False)
+                #left = values[0]
+                #right = ast.BoolOp(ast.And, values[1:])
+                #return ast.IfExp(
+                #    self.shrink_exp(left),
+                #    self.shrink_exp(right),
+                #    ast.Constant(False),
+                #)
+            case ast.BinOp(left, ast.Or, right):
+                return ast.IfExp(
+                    ast.Constant(True),
+                    self.shrink_exp(left),
+                    self.shrink_exp(right),
+                )
+            case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
+                return e
+            #   case ast.UnaryOp(operator, operand):
+            #    raise Exception(f"Unimplemented")
+            case _:
+                raise Exception(f"Unexpected expression during shrink: {e}")
+
+    def shrink_stmt(self, s: stmt) -> list[stmt]:
+        match s:
+            case ast.Expr(ast.Call(ast.Name("print"), [value])):
+                return [ast.Expr(ast.Call(ast.Name("print"), [self.shrink_exp(value)]))]
+            case ast.Assign([ast.Name(name)], value):
+                return [ast.Assign([ast.Name(name)], self.shrink_exp(value))]
+            case ast.If(test, body, orelse):
+                shrinked_test = self.shrink_exp(test)
+                shrinked_body = [
+                    shrunk_stmt
+                    for stmt in body
+                    for shrunk_stmt in self.shrink_stmt(stmt)
+                ]
+                shrinked_orelse = [
+                    shrunk_stmt
+                    for stmt in orelse
+                    for shrunk_stmt in self.shrink_stmt(stmt)
+                ]
+                return [ast.If(shrinked_test, shrinked_body, shrinked_orelse)]
+            case _:
+                raise Exception(f"Unexpected statement during shrink: {s}")
+
+
+    def shrink(self, p: Module) -> Module:
+        statements: list[stmt] = []
+        for statement in p.body:
+            statements.extend(self.shrink_stmt(statement))
+        return ast.Module(statements)
 
     ############################################################################
     # Remove Complex Operands
@@ -549,8 +608,11 @@ def main():
 
     compiler = Compiler()
 
-    simplified = compiler.remove_complex_operands(module)
+    shrinked = compiler.shrink(module)
+    checkpoint(args, "shrink", shrinked)
+    simplified = compiler.remove_complex_operands(shrinked)
     checkpoint(args, "remove_complex_operands", simplified)
+    return
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
     allocated = compiler.allocate_registers(
