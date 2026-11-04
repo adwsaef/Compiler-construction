@@ -6,6 +6,7 @@ import sys
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
+from cif import Begin  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
@@ -78,6 +79,12 @@ class Compiler:
                     [operator],
                     [self.shrink_exp(right)],
                 )
+            case ast.IfExp(test, body, orelse):
+                return ast.IfExp(
+                    self.shrink_exp(test),
+                    self.shrink_exp(body),
+                    self.shrink_exp(orelse),
+                )
             case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
                 return e
             case _:
@@ -116,6 +123,18 @@ class Compiler:
     # Remove Complex Operands
     ############################################################################
 
+    def make_begin(self, temporaries: Temporaries, result: expr) -> expr:
+        if not temporaries:
+            return result
+
+        return Begin(
+            [
+                ast.Assign([temporary_name], temporary_value)
+                for temporary_name, temporary_value in temporaries
+            ],
+            result,
+        )
+
     def rco_exp(self, e: expr, need_atomic : bool) -> tuple[expr, Temporaries]:
         match e:
             case ast.Constant() | ast.Name():
@@ -148,6 +167,38 @@ class Compiler:
 
                 temporary = ast.Name(generate_name("tmp"))
                 return temporary, left_temporaries + right_temporaries + [(temporary, binop)]
+
+            case ast.Compare(left, [operator], [right]):
+                atomic_left, left_temporaries = self.rco_exp(left, True)
+                atomic_right, right_temporaries = self.rco_exp(right, True)
+                comparison = ast.Compare(
+                    atomic_left,
+                    [operator],
+                    [atomic_right],
+                )
+                temporaries = left_temporaries + right_temporaries
+
+                if not need_atomic:
+                    return comparison, temporaries
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, temporaries + [(temporary, comparison)]
+
+            case ast.IfExp(test, body, orelse):
+                rco_test, test_temporaries = self.rco_exp(test, False)
+                rco_body, body_temporaries = self.rco_exp(body, False)
+                rco_orelse, orelse_temporaries = self.rco_exp(orelse, False)
+                conditional = ast.IfExp(
+                    self.make_begin(test_temporaries, rco_test),
+                    self.make_begin(body_temporaries, rco_body),
+                    self.make_begin(orelse_temporaries, rco_orelse),
+                )
+
+                if not need_atomic:
+                    return conditional, []
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, [(temporary, conditional)]
             case _:
                 raise Exception(f"Unexpected expression during RCO: {e}")
 
@@ -161,7 +212,6 @@ class Compiler:
                 ]
                 statements.append(ast.Expr(ast.Call(ast.Name("print"), [atom])))
                 return statements
-
             case ast.Assign([ast.Name(name)], value):
                 expression, temporaries = self.rco_exp(value, False)
                 statements = [
@@ -170,6 +220,20 @@ class Compiler:
                 ]
                 statements.append(ast.Assign([ast.Name(name)], expression))
                 return statements
+            case ast.If(test, body, orelse):
+                expression, temporaries = self.rco_exp(test, False)
+                rco_test = self.make_begin(temporaries, expression)
+                rco_body = [
+                    rco_statement
+                    for statement in body
+                    for rco_statement in self.rco_stmt(statement)
+                ]
+                rco_orelse = [
+                    rco_statement
+                    for statement in orelse
+                    for rco_statement in self.rco_stmt(statement)
+                ]
+                return [ast.If(rco_test, rco_body, rco_orelse)]
             case _:
                 raise Exception(f"Unexpected statement during RCO: {s}")
 
@@ -628,7 +692,6 @@ def main():
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)
     checkpoint(args, "remove_complex_operands", simplified)
-    return
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
     allocated = compiler.allocate_registers(
