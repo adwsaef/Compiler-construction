@@ -41,29 +41,45 @@ class Compiler:
     ############################################################################
 
     def shrink_exp(self, e: expr) -> expr:
-        print(f"Shrinking {e}", file=sys.stderr)
         match e:
-            case ast.BoolOp(ast.And, values):
-                raise Exception("Unimplemented")
-                #if not values:
-                #    return ast.Constant(False)
-                #left = values[0]
-                #right = ast.BoolOp(ast.And, values[1:])
-                #return ast.IfExp(
-                #    self.shrink_exp(left),
-                #    self.shrink_exp(right),
-                #    ast.Constant(False),
-                #)
-            case ast.BinOp(left, ast.Or, right):
-                return ast.IfExp(
-                    ast.Constant(True),
+            case ast.BoolOp(ast.And(), [left, right, *rest]):
+                values = [
+                    self.shrink_exp(value)
+                    for value in [left, right, *rest]
+                ]
+                result = values[-1]
+                for value in reversed(values[:-1]):
+                    result = ast.IfExp(value, result, ast.Constant(False))
+                return result
+            case ast.BoolOp(ast.Or(), [left, right, *rest]):
+                values = [
+                    self.shrink_exp(value)
+                    for value in [left, right, *rest]
+                ]
+                result = values[-1]
+                for value in reversed(values[:-1]):
+                    result = ast.IfExp(value, ast.Constant(True), result)
+                return result
+            case ast.UnaryOp(ast.Not(), operand):
+                return ast.UnaryOp(ast.Not(), self.shrink_exp(operand))
+            case ast.BinOp(
+                left,
+                (ast.Add() | ast.Sub() | ast.Mult()) as operator,
+                right,
+            ):
+                return ast.BinOp(
                     self.shrink_exp(left),
+                    operator,
                     self.shrink_exp(right),
+                )
+            case ast.Compare(left, [operator], [right]):
+                return ast.Compare(
+                    self.shrink_exp(left),
+                    [operator],
+                    [self.shrink_exp(right)],
                 )
             case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
                 return e
-            #   case ast.UnaryOp(operator, operand):
-            #    raise Exception(f"Unimplemented")
             case _:
                 raise Exception(f"Unexpected expression during shrink: {e}")
 
