@@ -257,6 +257,60 @@ class Compiler:
         return ast.Module(statements)
 
     ############################################################################
+    # ANF Check
+    ############################################################################
+
+    def is_atom(self, e: expr) -> bool:
+        return isinstance(e, (ast.Name, ast.Constant))
+
+    def is_anf_exp(self, e: expr) -> bool:
+        match e:
+            case ast.Constant() | ast.Name():
+                return True
+            case ast.BinOp(left, _, right):
+                return self.is_atom(left) and self.is_atom(right)
+            case ast.UnaryOp(ast.Not(), ast.Compare() as comparison):
+                return self.is_anf_exp(comparison)
+            case ast.UnaryOp(_, operand):
+                return self.is_atom(operand)
+            case ast.Compare(left, [_], [right]):
+                return self.is_atom(left) and self.is_atom(right)
+            case ast.Call(_, arguments):
+                return all(self.is_atom(argument) for argument in arguments)
+            case ast.IfExp(test, body, orelse):
+                return (
+                    self.is_anf_exp(test)
+                    and self.is_anf_exp(body)
+                    and self.is_anf_exp(orelse)
+                )
+            case Begin(body, result):
+                return all(self.is_anf_stmt(statement) for statement in body) \
+                    and self.is_anf_exp(result)
+            case _:
+                return False
+
+    def is_anf_stmt(self, s: stmt) -> bool:
+        match s:
+            case ast.Expr(value):
+                return self.is_anf_exp(value)
+            case ast.Assign(_, value):
+                return self.is_anf_exp(value)
+            case ast.If(test, body, orelse):
+                return (
+                    self.is_anf_exp(test)
+                    and all(self.is_anf_stmt(statement) for statement in body)
+                    and all(self.is_anf_stmt(statement) for statement in orelse)
+                )
+            case _:
+                return False
+
+    def is_anf(self, p: Module) -> bool:
+        for statement in p.body:
+            if not self.is_anf_stmt(statement):
+                return False
+        return True
+
+    ############################################################################
     # Select Instructions
     ############################################################################
 
@@ -704,6 +758,8 @@ def main():
     shrinked = compiler.shrink(module)
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)
+    assert compiler.is_anf(simplified), \
+        f"The AST is not in A-normal form:\n{simplified}"
     checkpoint(args, "remove_complex_operands", simplified)
     instruction_list = compiler.select_instructions(simplified)
     checkpoint(args, "select_instructions", instruction_list)
