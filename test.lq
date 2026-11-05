@@ -10,3 +10,8 @@ if x > 0 and x < 10 or x > 3 and x < 2:
 else:
     print(0)
     
+if input_int() > 0 and input_int()>1:
+    print(1)
+
+if not x > 0 or true:
+    print(2)
