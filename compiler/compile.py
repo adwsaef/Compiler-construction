@@ -63,6 +63,8 @@ class Compiler:
                 return result
             case ast.UnaryOp(ast.Not(), operand):
                 return ast.UnaryOp(ast.Not(), self.shrink_exp(operand))
+            case ast.UnaryOp(ast.USub(), operand):
+                return ast.UnaryOp(ast.USub(), self.shrink_exp(operand))
             case ast.BinOp(
                 left,
                 (ast.Add() | ast.Sub() | ast.Mult()) as operator,
@@ -147,6 +149,17 @@ class Compiler:
                 temporary = ast.Name(generate_name("tmp"))
                 return temporary, [(temporary, e)]
 
+            case ast.UnaryOp(ast.Not(), operand):
+                assert isinstance(operand, ast.Compare)
+                rco_operand, temporaries = self.rco_exp(operand, False)
+                result = ast.UnaryOp(ast.Not(), rco_operand)
+
+                if not need_atomic:
+                    return result, temporaries
+
+                temporary = ast.Name(generate_name("tmp"))
+                return temporary, temporaries + [(temporary, result)]
+
             case ast.UnaryOp(operator, operand):
                 atomic_operand, temporaries = self.rco_exp(operand, True)
                 result = ast.UnaryOp(operator, atomic_operand)
@@ -189,16 +202,16 @@ class Compiler:
                 rco_body, body_temporaries = self.rco_exp(body, False)
                 rco_orelse, orelse_temporaries = self.rco_exp(orelse, False)
                 conditional = ast.IfExp(
-                    self.make_begin(test_temporaries, rco_test),
+                    rco_test,
                     self.make_begin(body_temporaries, rco_body),
                     self.make_begin(orelse_temporaries, rco_orelse),
                 )
 
                 if not need_atomic:
-                    return conditional, []
+                    return conditional, test_temporaries
 
                 temporary = ast.Name(generate_name("tmp"))
-                return temporary, [(temporary, conditional)]
+                return temporary, test_temporaries + [(temporary, conditional)]
             case _:
                 raise Exception(f"Unexpected expression during RCO: {e}")
 
