@@ -8,7 +8,7 @@ from ast import (Constant, UnaryOp, expr, stmt, Module, Name, IfExp)
 from unittest import case
 from ast_utils import generate_name  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
-from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
+from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
 Binding = tuple[Name, expr]
@@ -151,8 +151,10 @@ class Compiler:
                 return temporary, [(temporary, e)]
 
             case ast.UnaryOp(ast.Not(), operand):
-                assert isinstance(operand, ast.Compare)
-                rco_operand, temporaries = self.rco_exp(operand, False)
+                rco_operand, temporaries = self.rco_exp(
+                    operand,
+                    need_atomic=not isinstance(operand, ast.Compare),
+                )
                 result = ast.UnaryOp(ast.Not(), rco_operand)
 
                 if not need_atomic:
@@ -446,9 +448,9 @@ class Compiler:
 
     def explicate_control(self, p: Module) -> CProgram:
         basic_blocks: BasicBlocks = {}
-        basic_blocks["start"] = self.explicate_stmts(
+        basic_blocks["main_start"] = self.explicate_stmts(
             p.body,
-            [],
+            [ast.Return(ast.Constant(0))],
             basic_blocks,
         )
         return CProgram(basic_blocks)
@@ -470,6 +472,8 @@ class Compiler:
         match e:
             case Constant(value):
                 match value:
+                    case bool():
+                        return Immediate(1 if value else 0)
                     case int():
                         self.immediate_size(value)
                         return Immediate(value)
@@ -480,8 +484,70 @@ class Compiler:
             case _:
                 raise Exception(f"Unexpected expression {e}")
 
+    def select_jmp(self, comparison: ast.cmpop) -> str:
+        match comparison:
+            case ast.Eq():
+                return "e"
+            case ast.NotEq():
+                return "ne"
+            case ast.Lt():
+                return "l"
+            case ast.LtE():
+                return "le"
+            case ast.Gt():
+                return "g"
+            case ast.GtE():
+                return "ge"
+            case _:
+                raise Exception(f"Unsupported comparison: {comparison}")
+
+    def negate_comparison(self, comparison: ast.cmpop) -> ast.cmpop:
+        match comparison:
+            case ast.Eq():
+                return ast.NotEq()
+            case ast.NotEq():
+                return ast.Eq()
+            case ast.Lt():
+                return ast.GtE()
+            case ast.LtE():
+                return ast.Gt()
+            case ast.Gt():
+                return ast.LtE()
+            case ast.GtE():
+                return ast.Lt()
+            case _:
+                raise Exception(f"Unsupported comparison: {comparison}")
+
+    def select_compare(
+        self, var: expr, comparison: ast.cmpop, left: expr, right: expr
+    ) -> list[instr]:
+        al = ByteReg("al")
+        return [
+            Instr("cmpq", [self.select_arg(right), self.select_arg(left)]),
+            Instr("set" + self.select_jmp(comparison), [al]),
+            Instr("movzbq", [al, self.select_arg(var)]),
+        ]
+
     def select_stmt(self, s: stmt) -> list[instr]:
         match s:
+            case Goto(label):
+                return [Jump(label)]
+
+            case ast.Return(value):
+                if value is None:
+                    return [Jump("main_conclusion")]
+                return [
+                    Instr("movq", [self.select_arg(value), SCRATCH_REGISTER]),
+                    Jump("main_conclusion"),
+                ]
+
+            case ast.If(ast.Compare(left, [comparison], [right]), [Goto(thn)], [Goto(els)]):
+                return [
+                    Instr("cmpq", [self.select_arg(right), self.select_arg(left)]),
+                    JumpIf(self.select_jmp(comparison), thn),
+                    Jump(els),
+                ]
+
             case ast.Expr(ast.Call(ast.Name("print"), [atom])):
                 return [
                     Instr("movq", [self.select_arg(atom), Reg("rdi")]),
@@ -498,6 +564,27 @@ class Compiler:
                             Callq("input_int", 0),
                             Instr("movq", [Reg("rax"), Variable(lhs)]),
                         ]
+
+                    case ast.UnaryOp(ast.Not(), ast.Compare(left, [comparison], [right])):
+                        return self.select_compare(
+                            ast.Name(lhs),
+                            self.negate_comparison(comparison),
+                            left,
+                            right,
+                        )
+
+                    case ast.Compare(left, [comparison], [right]):
+                        return self.select_compare(
+                            ast.Name(lhs), comparison, left, right
+                        )
+
+                    case ast.UnaryOp(ast.Not(), atom):
+                        source = self.select_arg(atom)
+                        target = Variable(lhs)
+                        flip = Instr("xorq", [Immediate(1), target])
+                        if source == target:
+                            return [flip]
+                        return [Instr("movq", [source, target]), flip]
 
                     case ast.UnaryOp(ast.USub(), value):
                         return [
@@ -557,11 +644,14 @@ class Compiler:
             case _:
                 raise Exception(f"Unexpected statement {s}, it must be assignment or print")
 
-    def select_instructions(self, p: Module) -> X86Program:
-        instructions: list[instr] = []
-        for s in p.body:
-            instructions.extend(self.select_stmt(s))
-        return X86Program(instructions)
+    def select_instructions(self, p: CProgram) -> X86Program:
+        blocks: dict[str, list[instr]] = {}
+        for label, statements in p.body.items():
+            instructions: list[instr] = []
+            for statement in statements:
+                instructions.extend(self.select_stmt(statement))
+            blocks[label] = instructions
+        return X86Program(blocks)
 
 
     ############################################################################
