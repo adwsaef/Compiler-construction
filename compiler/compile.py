@@ -4,9 +4,10 @@ import ast
 import argparse
 import sys
 
-from ast import (Constant, expr, stmt, Module, Name, IfExp)
+from ast import (Constant, UnaryOp, expr, stmt, Module, Name, IfExp)
+from unittest import case
 from ast_utils import generate_name  # type: ignore[import-untyped]
-from cif import Begin  # type: ignore[import-untyped]
+from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
@@ -283,9 +284,10 @@ class Compiler:
                     and self.is_anf_exp(body)
                     and self.is_anf_exp(orelse)
                 )
-            case Begin(body, result):
-                return all(self.is_anf_stmt(statement) for statement in body) \
-                    and self.is_anf_exp(result)
+            case Begin() as begin:
+                return all(
+                    self.is_anf_stmt(statement) for statement in begin.body
+                ) and self.is_anf_exp(begin.result)
             case _:
                 return False
 
@@ -309,6 +311,147 @@ class Compiler:
             if not self.is_anf_stmt(statement):
                 return False
         return True
+
+    ############################################################################
+    # Explicate Control
+    ############################################################################
+
+    def create_block(
+        self,
+        statements: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        match statements:
+            case [Goto(_label)]:
+                return statements
+            case _:
+                label = generate_name("block")
+                basic_blocks[label] = statements
+                return [Goto(label)]
+
+    def explicate_stmts(
+        self,
+        statements: list[stmt],
+        cont: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        for statement in reversed(statements):
+            cont = self.explicate_stmt(statement, cont, basic_blocks)
+        return cont
+
+    def explicate_stmt(
+        self,
+        s: stmt,
+        cont: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        match s:
+            case ast.Expr(ast.Call(ast.Name("print"), [atom]) as call):
+                return self.explicate_effect(call, cont, basic_blocks)
+            case ast.Assign([lhs], rhs):
+                return self.explicate_assign(rhs, lhs, cont, basic_blocks)
+            case ast.If(test, body, orelse):
+                goto_cont = self.create_block(cont, basic_blocks)
+                new_body   = self.explicate_stmts(body,   goto_cont, basic_blocks)
+                new_orelse = self.explicate_stmts(orelse, goto_cont, basic_blocks)
+                return self.explicate_pred(test, new_body, new_orelse, basic_blocks)
+            case _:
+                raise Exception(f"Unexpected statement during explicate control: {s}")
+
+    def explicate_assign(
+        self,
+        rhs: expr,
+        lhs: expr,
+        cont: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        match rhs:
+            case IfExp(test, body, orelse):
+                goto_cont = self.create_block(cont, basic_blocks)
+                then_branch = self.explicate_assign(body,   lhs, goto_cont, basic_blocks)
+                else_branch = self.explicate_assign(orelse, lhs, goto_cont, basic_blocks)
+                return self.explicate_pred(test, then_branch, else_branch, basic_blocks)
+            case Begin() as begin:
+                result_continuation = self.explicate_assign(begin.result, lhs, cont, basic_blocks)
+                return self.explicate_stmts(begin.body, result_continuation, basic_blocks)
+            case (
+                ast.Name()
+                | ast.Constant(int() | bool())
+                | ast.Call(ast.Name("input_int"), [], [])
+                | ast.UnaryOp(ast.USub() | ast.Not(), _)
+                | ast.BinOp(_, ast.Add() | ast.Sub() | ast.Mult(), _)
+                | ast.Compare(_, [_], [_])
+            ) if self.is_anf_exp(rhs):
+                return [ast.Assign([lhs], rhs)] + cont
+            case _:
+                raise Exception(f"Unexpected assignment expression during explicate control: {rhs}")
+
+    def explicate_effect(
+        self,
+        e: expr,
+        cont: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        match e:
+            case Begin() as begin:
+                result_continuation = self.explicate_effect(begin.result, cont, basic_blocks)
+                return self.explicate_stmts(begin.body, result_continuation, basic_blocks)
+            case ast.Call():
+                return [ast.Expr(e)] + cont
+            case _:
+                raise Exception(f"Unexpected effect expression during explicate control: {e}")
+
+    def explicate_pred(
+        self,
+        cnd: expr,
+        thn: list[stmt],
+        els: list[stmt],
+        basic_blocks: BasicBlocks,
+    ) -> list[stmt]:
+        match cnd:
+            case ast.Compare(left, [op], [right]):
+                goto_thn = self.create_block(thn, basic_blocks)
+                goto_els = self.create_block(els, basic_blocks)
+                return [ast.If(cnd, goto_thn, goto_els)]
+
+            case ast.Constant(True):  return thn
+            case ast.Constant(False): return els
+
+            case ast.UnaryOp(ast.Not(), operand):
+                return self.explicate_pred(operand, els, thn, basic_blocks)
+
+            case ast.IfExp(test, body, orelse):
+                elsblock = self.create_block(els, basic_blocks)
+                thnblock = self.create_block(thn, basic_blocks)
+                body_branch   = self.explicate_pred(body,   thnblock, elsblock, basic_blocks)
+                orelse_branch = self.explicate_pred(orelse, thnblock, elsblock, basic_blocks)
+                return self.explicate_pred(test, body_branch, orelse_branch, basic_blocks)
+
+            case Begin() as begin:
+                new_result = self.explicate_pred(
+                    begin.result, thn, els, basic_blocks
+                )
+                return self.explicate_stmts(
+                    begin.body, new_result, basic_blocks
+                )
+
+            case ast.Name() | ast.Constant():
+                return [ast.If(ast.Compare(cnd, [ast.Eq()], [ast.Constant(False)]),
+                        self.create_block(els, basic_blocks),
+                        self.create_block(thn, basic_blocks))]
+            case _:
+                temp = ast.Name(generate_name('tmp'))
+                return [ast.Assign([temp], cnd)] + self.explicate_pred(temp, thn, els,
+                                                            basic_blocks)
+
+    def explicate_control(self, p: Module) -> CProgram:
+        basic_blocks: BasicBlocks = {}
+        basic_blocks["start"] = self.explicate_stmts(
+            p.body,
+            [],
+            basic_blocks,
+        )
+        return CProgram(basic_blocks)
 
     ############################################################################
     # Select Instructions
@@ -761,7 +904,9 @@ def main():
     assert compiler.is_anf(simplified), \
         f"The AST is not in A-normal form:\n{simplified}"
     checkpoint(args, "remove_complex_operands", simplified)
-    instruction_list = compiler.select_instructions(simplified)
+    explicated = compiler.explicate_control(simplified)
+    checkpoint(args, "explicate_control", explicated)
+    instruction_list = compiler.select_instructions(explicated)
     checkpoint(args, "select_instructions", instruction_list)
     allocated = compiler.allocate_registers(
         instruction_list, registers_cap=args.registers_cap,

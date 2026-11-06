@@ -13,5 +13,12 @@ else:
 if input_int() > 0 and input_int()>1:
     print(1)
 
-if not x > 0 or true:
+if not x > 0 or True:
     print(2)
+
+if input_int() + 1 > 0:
+    print(3)
+else:
+    print(4)
+
+print((input_int() + 1) if x > 0 else 0)

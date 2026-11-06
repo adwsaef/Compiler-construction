@@ -1,4 +1,1 @@
 print((input_int() + 1) if x > 0 else 0)
-
-if not 2 <3 and not 5 < input_int():
-    print(-5)
