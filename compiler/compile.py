@@ -15,6 +15,8 @@ Binding = tuple[Name, expr]
 Temporaries = list[Binding]
 
 SCRATCH_REGISTER = Reg("rax")
+MAIN_START = "main_start"
+MAIN_CONCLUSION = "main_conclusion"
 ARGUMENT_REGISTERS = (
     Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
 )
@@ -448,7 +450,7 @@ class Compiler:
 
     def explicate_control(self, p: Module) -> CProgram:
         basic_blocks: BasicBlocks = {}
-        basic_blocks["main_start"] = self.explicate_stmts(
+        basic_blocks[MAIN_START] = self.explicate_stmts(
             p.body,
             [ast.Return(ast.Constant(0))],
             basic_blocks,
@@ -562,10 +564,10 @@ class Compiler:
 
             case ast.Return(value):
                 if value is None:
-                    return [Jump("main_conclusion")]
+                    return [Jump(MAIN_CONCLUSION)]
                 return [
                     Instr("movq", [self.select_arg(value), SCRATCH_REGISTER]),
-                    Jump("main_conclusion"),
+                    Jump(MAIN_CONCLUSION),
                 ]
 
             case ast.If(ast.Compare(left, [comparison], [right]), [Goto(thn)], [Goto(els)]):
@@ -573,10 +575,10 @@ class Compiler:
                 right_arg = self.select_arg(right)
                 match left_arg, right_arg:
                     case Immediate(left_value), Immediate(right_value):
-                        value = self.compare_constants(
+                        constant_result = self.compare_constants(
                             comparison, left_value, right_value
                         )
-                        return [Jump(thn if value else els)]
+                        return [Jump(thn if constant_result else els)]
                 return [
                     Instr("cmpq", [right_arg, left_arg]),
                     JumpIf(self.select_jmp(comparison), thn),
@@ -1027,17 +1029,23 @@ class Compiler:
         )
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        assert isinstance(p.body, list)
-        used_stack_bytes = self.used_stack_size(p.body)
+        blocks = p.body
+        assert isinstance(blocks, dict)
+        instructions = [i for block in blocks.values() for i in block]
+        used_stack_bytes = self.used_stack_size(instructions)
 
-        saved_registers = list(self.used_callee_saved_registers(p.body))
+        used_saved_registers = self.used_callee_saved_registers(instructions)
+        saved_registers = [
+            register for register in CALLEE_SAVED_REGISTERS
+            if register in used_saved_registers
+        ]
         saved_register_bytes = 8 * len(saved_registers)
         stack_adjustment = (
             (used_stack_bytes + saved_register_bytes + 15) // 16 * 16
             - saved_register_bytes
         )
 
-        prologue = [
+        prologue: list[instr] = [
             Instr("pushq", [Reg("rbp")]),
             Instr("movq", [Reg("rsp"), Reg("rbp")]),
         ]
@@ -1051,12 +1059,15 @@ class Compiler:
         if stack_adjustment:
             conclusion.append(Instr("addq", [Immediate(stack_adjustment), Reg("rsp")]))
         conclusion.extend([
-            Instr("movq", [Immediate(0), Reg("rax")]),
             Instr("popq", [Reg("rbp")]),
             Instr("retq", []),
         ])
 
-        p.body = prologue + p.body + conclusion
+        p.body = {
+            "main": prologue + [Jump(MAIN_START)],
+            **blocks,
+            MAIN_CONCLUSION: conclusion,
+        }
 
         return p
 
