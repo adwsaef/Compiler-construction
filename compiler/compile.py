@@ -518,12 +518,39 @@ class Compiler:
             case _:
                 raise Exception(f"Unsupported comparison: {comparison}")
 
+    def compare_constants(
+        self, comparison: ast.cmpop, left: int, right: int
+    ) -> bool:
+        self.immediate_size(left)
+        self.immediate_size(right)
+        match comparison:
+            case ast.Eq():
+                return left == right
+            case ast.NotEq():
+                return left != right
+            case ast.Lt():
+                return left < right
+            case ast.LtE():
+                return left <= right
+            case ast.Gt():
+                return left > right
+            case ast.GtE():
+                return left >= right
+            case _:
+                raise Exception(f"Unsupported comparison: {comparison}")
+
     def select_compare(
         self, var: expr, comparison: ast.cmpop, left: expr, right: expr
     ) -> list[instr]:
+        left_arg = self.select_arg(left)
+        right_arg = self.select_arg(right)
+        match left_arg, right_arg:
+            case Immediate(left_value), Immediate(right_value):
+                value = self.compare_constants(comparison, left_value, right_value)
+                return [Instr("movq", [Immediate(int(value)), self.select_arg(var)])]
         al = ByteReg("al")
         return [
-            Instr("cmpq", [self.select_arg(right), self.select_arg(left)]),
+            Instr("cmpq", [right_arg, left_arg]),
             Instr("set" + self.select_jmp(comparison), [al]),
             Instr("movzbq", [al, self.select_arg(var)]),
         ]
@@ -542,8 +569,16 @@ class Compiler:
                 ]
 
             case ast.If(ast.Compare(left, [comparison], [right]), [Goto(thn)], [Goto(els)]):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                match left_arg, right_arg:
+                    case Immediate(left_value), Immediate(right_value):
+                        value = self.compare_constants(
+                            comparison, left_value, right_value
+                        )
+                        return [Jump(thn if value else els)]
                 return [
-                    Instr("cmpq", [self.select_arg(right), self.select_arg(left)]),
+                    Instr("cmpq", [right_arg, left_arg]),
                     JumpIf(self.select_jmp(comparison), thn),
                     Jump(els),
                 ]
@@ -918,6 +953,20 @@ class Compiler:
         match i:
             case Instr(instr="movq", args=[source, destination]) if source == destination:
                 return []
+            case Instr(instr="cmpq", args=[Immediate(), Immediate()]):
+                raise AssertionError("constant comparison should be selected without cmpq")
+            case Instr(instr="cmpq", args=[source, Immediate() as destination]):
+                self.immediate_size(destination.value)
+                return [
+                    Instr("movq", [destination, SCRATCH_REGISTER]),
+                    Instr("cmpq", [source, SCRATCH_REGISTER]),
+                ]
+            case Instr(instr="movzbq", args=[source, destination]) \
+                    if is_memory_arg(destination):
+                return [
+                    Instr("movzbq", [source, SCRATCH_REGISTER]),
+                    Instr("movq", [SCRATCH_REGISTER, destination]),
+                ]
             case Instr():
                 for a in i.args:
                     if type(a) is Immediate:
@@ -944,12 +993,15 @@ class Compiler:
         return [i]
 
     def patch_instructions(self, p: X86Program) -> X86Program:
-        instructions: list[instr] = []
-        for i in p.body:
-            match i:
-                case instr():
-                    instructions.extend(self.patch_instr(i))
-        return X86Program(instructions)     
+        assert isinstance(p.body, dict)
+        blocks: dict[str, list[instr]] = {}
+        for label, instructions in p.body.items():
+            blocks[label] = [
+                patched
+                for instruction in instructions
+                for patched in self.patch_instr(instruction)
+            ]
+        return X86Program(blocks, p.entries)
 
     ############################################################################
     # Prelude & Conclusion
