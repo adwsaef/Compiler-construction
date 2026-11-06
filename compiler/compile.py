@@ -873,6 +873,44 @@ class Compiler:
         return p
 
     ############################################################################
+    # Assign Homes
+    ############################################################################
+
+    def assign_homes_arg(
+        self, operand: arg, homes: dict[Variable, arg]
+    ) -> arg:
+        match operand:
+            case Variable():
+                if operand not in homes:
+                    homes[operand] = Deref("rbp", -8 * (len(homes) + 1))
+                return homes[operand]
+            case _:
+                return operand
+
+    def assign_homes_instr(
+        self, instruction: instr, homes: dict[Variable, arg]
+    ) -> instr:
+        match instruction:
+            case Instr():
+                return Instr(
+                    instruction.instr,
+                    [self.assign_homes_arg(operand, homes) for operand in instruction.args],
+                )
+            case _:
+                return instruction
+
+    def assign_homes(self, p: X86Program) -> X86Program:
+        homes: dict[Variable, arg] = {}
+        if isinstance(p.body, dict):
+            blocks = {
+                label: [self.assign_homes_instr(i, homes) for i in instructions]
+                for label, instructions in p.body.items()
+            }
+            return X86Program(blocks, p.entries)
+        instructions = [self.assign_homes_instr(i, homes) for i in p.body]
+        return X86Program(instructions, p.entries)
+
+    ############################################################################
     # Patch Instructions
     ############################################################################
     def patch_instr(self, i: instr) -> list[instr]:
@@ -998,10 +1036,13 @@ def main():
     checkpoint(args, "explicate_control", explicated)
     instruction_list = compiler.select_instructions(explicated)
     checkpoint(args, "select_instructions", instruction_list)
-    allocated = compiler.allocate_registers(
-        instruction_list, registers_cap=args.registers_cap,
-        debug_allocate_registers=args.debug_allocate_registers,
-    )
+    if isinstance(instruction_list.body, list):
+        allocated = compiler.allocate_registers(
+            instruction_list, registers_cap=args.registers_cap,
+            debug_allocate_registers=args.debug_allocate_registers,
+        )
+    else:
+        allocated = compiler.assign_homes(instruction_list)
     checkpoint(args, "allocate_registers", allocated)
     patched_instructions = compiler.patch_instructions(allocated)
     checkpoint(args, "patch_instructions", patched_instructions)
