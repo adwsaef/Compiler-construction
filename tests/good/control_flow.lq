@@ -1,0 +1,37 @@
+a = input_int()
+b = input_int()
+score = 0
+if a > 0 and b > 0:
+    score = score + 1
+else:
+    score = score + 2
+if (a > 0 and b < 0) or not (b == 0):
+    score = score + 4
+else:
+    score = score + 8
+if not (a == b):
+    score = score + 16
+else:
+    score = score + 32
+if a > 0:
+    if b < 0:
+        score = score + 64
+    else:
+        score = score + 128
+else:
+    score = score + 256
+if not (a > 0 and b > 0):
+    score = score + 512
+else:
+    score = score + 1024
+if a and b:
+    score = score + 2048
+else:
+    score = score + 4096
+if 0:
+    score = score + 8192
+else:
+    score = score + 16384
+if 1:
+    score = score + 32768
+print(score)
