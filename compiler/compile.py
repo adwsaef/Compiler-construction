@@ -768,14 +768,12 @@ class Compiler:
                 instruction = instructions[index]
                 match instruction:
                     case Jump(label=target):
-                        after = live_before_block[target].copy()
+                        live = live_before_block[target].copy()
                     case JumpIf(label=target):
-                        after = live_before_block[target] | live
-                    case _:
-                        after = live.copy()
-                after_instructions[index] = after
+                        live |= live_before_block[target]
+                after_instructions[index] = live.copy()
                 live = (
-                    (after - self.instruction_write(instruction))
+                    (live - self.instruction_write(instruction))
                     | self.instruction_read(instruction)
                 )
             live_after[label] = after_instructions
