@@ -1,0 +1,11 @@
+n = input_int()
+a = input_int()
+b = input_int()
+c = input_int()
+d = input_int()
+e = input_int()
+while n > 0:
+    a = a + input_int()
+    b = b + 1
+    n = n - 1
+print(a + b + c + d + e)

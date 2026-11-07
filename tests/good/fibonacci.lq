@@ -1,0 +1,11 @@
+n = input_int()
+index = 0
+current = 0
+following = 1
+while index < n:
+    print(current)
+    next_value = current + following
+    current = following
+    following = next_value
+    index = index + 1
+print(current)

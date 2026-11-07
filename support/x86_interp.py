@@ -801,12 +801,13 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
 
 
 def interp_x86(prog: Program | ast.Module | CProgram, **kwargs) -> list[int] | None:
-    """Print a Python module, or interpret an x86 program."""
+    """Print the program, and interpret it when it is x86."""
     match prog:
         case ast.Module() | CProgram():
             print(prog)
             return None
         case _:
+            print(prog, file=sys.stderr)
             return run(blocks_of(prog), **kwargs)
 
 

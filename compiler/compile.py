@@ -3,12 +3,13 @@
 import ast
 import argparse
 import sys
+from collections import deque
 
 from ast import (Constant, UnaryOp, expr, stmt, Module, Name, IfExp)
 from unittest import case
 from ast_utils import generate_name  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
-from graph import DirectedAdjList, topological_sort, transpose  # type: ignore[import-untyped]
+from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
@@ -102,7 +103,7 @@ class Compiler:
                 return [ast.Expr(ast.Call(ast.Name("print"), [self.shrink_exp(value)]))]
             case ast.Assign([ast.Name(name)], value):
                 return [ast.Assign([ast.Name(name)], self.shrink_exp(value))]
-            case ast.If(test, body, orelse):
+            case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 shrinked_test = self.shrink_exp(test)
                 shrinked_body = [
                     shrunk_stmt
@@ -114,7 +115,9 @@ class Compiler:
                     for stmt in orelse
                     for shrunk_stmt in self.shrink_stmt(stmt)
                 ]
-                return [ast.If(shrinked_test, shrinked_body, shrinked_orelse)]
+                if isinstance(s, ast.If):
+                    return [ast.If(shrinked_test, shrinked_body, shrinked_orelse)]
+                return [ast.While(shrinked_test, shrinked_body, shrinked_orelse)]
             case _:
                 raise Exception(f"Unexpected statement during shrink: {s}")
 
@@ -239,7 +242,7 @@ class Compiler:
                 ]
                 statements.append(ast.Assign([ast.Name(name)], expression))
                 return statements
-            case ast.If(test, body, orelse):
+            case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 expression, temporaries = self.rco_exp(test, False)
                 rco_test = self.make_begin(temporaries, expression)
                 rco_body = [
@@ -252,7 +255,9 @@ class Compiler:
                     for statement in orelse
                     for rco_statement in self.rco_stmt(statement)
                 ]
-                return [ast.If(rco_test, rco_body, rco_orelse)]
+                if isinstance(s, ast.If):
+                    return [ast.If(rco_test, rco_body, rco_orelse)]
+                return [ast.While(rco_test, rco_body, rco_orelse)]
             case _:
                 raise Exception(f"Unexpected statement during RCO: {s}")
 
@@ -302,7 +307,7 @@ class Compiler:
                 return self.is_anf_exp(value)
             case ast.Assign(_, value):
                 return self.is_anf_exp(value)
-            case ast.If(test, body, orelse):
+            case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 return (
                     self.is_anf_exp(test)
                     and all(self.is_anf_stmt(statement) for statement in body)
@@ -360,6 +365,15 @@ class Compiler:
                 new_body   = self.explicate_stmts(body,   goto_cont, basic_blocks)
                 new_orelse = self.explicate_stmts(orelse, goto_cont, basic_blocks)
                 return self.explicate_pred(test, new_body, new_orelse, basic_blocks)
+            case ast.While(test, body, orelse):
+                loop_label = generate_name("loop")
+                goto_loop: list[stmt] = [Goto(loop_label)]
+                new_body = self.explicate_stmts(body, goto_loop, basic_blocks)
+                new_orelse = self.explicate_stmts(orelse, cont, basic_blocks)
+                basic_blocks[loop_label] = self.explicate_pred(
+                    test, new_body, new_orelse, basic_blocks
+                )
+                return goto_loop
             case _:
                 raise Exception(f"Unexpected statement during explicate control: {s}")
 
@@ -755,13 +769,19 @@ class Compiler:
         return graph
 
     def uncover_live(self, p: X86Program) -> dict[str, list[set[arg]]]:
-        blocks = p.body
-        assert isinstance(blocks, dict)
-        order = topological_sort(transpose(self.control_flow_graph(p)))
-        live_before_block: dict[str, set[arg]] = {}
+        assert isinstance(p.body, dict)
+        cfg = self.control_flow_graph(p)
+        predecessors = transpose(cfg)
+        worklist = deque(cfg.vertices())
+        queued = set(worklist)
+        live_before_block: dict[str, set[arg]] = {
+            label: set() for label in cfg.vertices()
+        }
         live_after: dict[str, list[set[arg]]] = {}
-        for label in order:
-            instructions = blocks.get(label, [])
+        while worklist:
+            label = worklist.pop()
+            queued.remove(label)
+            instructions = p.body.get(label, [])
             live: set[arg] = set()
             after_instructions: list[set[arg]] = [set() for _ in instructions]
             for index in reversed(range(len(instructions))):
@@ -777,7 +797,12 @@ class Compiler:
                     | self.instruction_read(instruction)
                 )
             live_after[label] = after_instructions
-            live_before_block[label] = live
+            if live != live_before_block[label]:
+                live_before_block[label] = live
+                for predecessor in predecessors.adjacent(label):
+                    if predecessor not in queued:
+                        worklist.append(predecessor)
+                        queued.add(predecessor)
         return live_after
 
     def instruction_edges(
