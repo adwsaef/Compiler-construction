@@ -8,6 +8,7 @@ from ast import (Constant, UnaryOp, expr, stmt, Module, Name, IfExp)
 from unittest import case
 from ast_utils import generate_name  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
+from graph import DirectedAdjList, topological_sort, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
 from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
 
@@ -697,6 +698,8 @@ class Compiler:
 
     def operand_locations(self, operand: arg) -> set[arg]:
         match operand:
+            case ByteReg("al"):
+                return {Reg("rax")}
             case Variable() | Reg():
                 return {operand}
             case Immediate():
@@ -708,15 +711,19 @@ class Compiler:
         match instruction:
             case Callq(num_args=arity):
                 return set(ARGUMENT_REGISTERS[:arity])
-            case Instr(instr="movq", args=[source, _]):
+            case Instr(instr="movq" | "movzbq", args=[source, _]):
                 return self.operand_locations(source)
             case Instr(
-                instr="addq" | "subq" | "imulq",
+                instr="addq" | "subq" | "imulq" | "cmpq" | "xorq",
                 args=[source, destination],
             ):
                 return self.operand_locations(source) | self.operand_locations(destination)
             case Instr(instr="negq", args=[destination]):
                 return self.operand_locations(destination)
+            case Instr(instr=name) if name.startswith("set"):
+                return set()
+            case Jump() | JumpIf():
+                return set()
             case _:
                 raise ValueError(f"Reads are not defined for {instruction}")
 
@@ -725,22 +732,54 @@ class Compiler:
             case Callq():
                 return set(CALLER_SAVED_REGISTERS)
             case Instr(
-                instr="movq" | "addq" | "subq" | "imulq",
+                instr="movq" | "movzbq" | "addq" | "subq" | "imulq" | "xorq",
                 args=[_, destination],
             ) | Instr(instr="negq", args=[destination]):
                 return self.operand_locations(destination)
+            case Instr(instr=name, args=[destination]) if name.startswith("set"):
+                return self.operand_locations(destination)
+            case Instr(instr="cmpq") | Jump() | JumpIf():
+                return set()
             case _:
                 raise ValueError(f"Writes are not defined for {instruction}")
 
-    def uncover_live(self, p: X86Program) -> dict[int, set[arg]]:
-        assert isinstance(p.body, list)
-        live: set[arg] = set()
-        live_after: dict[int, set[arg]] = {}
-        for index in reversed(range(len(p.body))):
-            live_after[index] = live.copy()
-            reads = self.instruction_read(p.body[index])
-            writes = self.instruction_write(p.body[index])
-            live = (live - writes) | reads
+    def control_flow_graph(self, p: X86Program) -> DirectedAdjList:
+        assert isinstance(p.body, dict)
+        graph = DirectedAdjList()
+        for label, instructions in p.body.items():
+            graph.add_vertex(label)
+            for instruction in instructions:
+                match instruction:
+                    case Jump(label=target) | JumpIf(label=target):
+                        graph.add_edge(label, target)
+        return graph
+
+    def uncover_live(self, p: X86Program) -> dict[str, list[set[arg]]]:
+        blocks = p.body
+        assert isinstance(blocks, dict)
+        order = topological_sort(transpose(self.control_flow_graph(p)))
+        live_before_block: dict[str, set[arg]] = {}
+        live_after: dict[str, list[set[arg]]] = {}
+        for label in order:
+            instructions = blocks.get(label, [])
+            live: set[arg] = set()
+            after_instructions: list[set[arg]] = [set() for _ in instructions]
+            for index in reversed(range(len(instructions))):
+                instruction = instructions[index]
+                match instruction:
+                    case Jump(label=target):
+                        after = live_before_block[target].copy()
+                    case JumpIf(label=target):
+                        after = live_before_block[target] | live
+                    case _:
+                        after = live.copy()
+                after_instructions[index] = after
+                live = (
+                    (after - self.instruction_write(instruction))
+                    | self.instruction_read(instruction)
+                )
+            live_after[label] = after_instructions
+            live_before_block[label] = live
         return live_after
 
     def instruction_edges(
@@ -764,31 +803,34 @@ class Compiler:
     def build_interference_graph(
         self,
         p: X86Program,
-        live_after: dict[int, set[arg]],
+        live_after: dict[str, list[set[arg]]],
     ) -> dict[arg, set[arg]]:
-        assert isinstance(p.body, list)
+        blocks = p.body
+        assert isinstance(blocks, dict)
         graph: dict[arg, set[arg]] = {}
-        for index, instruction in enumerate(p.body):
-            writes = self.instruction_write(instruction)
-            for location in live_after[index] | writes:
-                graph.setdefault(location, set())
+        for label, instructions in blocks.items():
+            for index, instruction in enumerate(instructions):
+                writes = self.instruction_write(instruction)
+                for location in live_after[label][index] | writes:
+                    graph.setdefault(location, set())
 
-            edges = self.instruction_edges(instruction, live_after[index])
-            for destination, neighbor in edges:
-                graph[destination].add(neighbor)
-                graph[neighbor].add(destination)
+                edges = self.instruction_edges(instruction, live_after[label][index])
+                for destination, neighbor in edges:
+                    graph[destination].add(neighbor)
+                    graph[neighbor].add(destination)
         return graph
 
 
     def debug_register_allocation(
         self,
         p: X86Program,
-        live_after: dict[int, set[arg]],
+        live_after: dict[str, list[set[arg]]],
         allocatable_registers: tuple[Reg, ...],
         coloring: dict[arg, int],
         homes: dict[Variable, arg],
     ) -> None:
-        assert isinstance(p.body, list)
+        blocks = p.body
+        assert isinstance(blocks, dict)
 
         print(
             "Available for allocation: "
@@ -797,13 +839,15 @@ class Compiler:
         )
 
         rows: list[tuple[str, str, str]] = []
-        for index, instruction in enumerate(p.body):
-            live_text = "{" + ", ".join(sorted(map(str, live_after[index]))) + "}"
-            edges = self.instruction_edges(instruction, live_after[index])
-            edge_text = ", ".join(sorted(
-                f"{destination}-{neighbor}" for destination, neighbor in edges
-            )) or "--"
-            rows.append((str(instruction).strip(), live_text, edge_text))
+        for label, instructions in blocks.items():
+            for index, instruction in enumerate(instructions):
+                after = live_after[label][index]
+                live_text = "{" + ", ".join(sorted(map(str, after))) + "}"
+                edges = self.instruction_edges(instruction, after)
+                edge_text = ", ".join(sorted(
+                    f"{destination}-{neighbor}" for destination, neighbor in edges
+                )) or "--"
+                rows.append((f"{label}: {str(instruction).strip()}", live_text, edge_text))
 
         instruction_width = max([len("Instruction")] + [len(row[0]) for row in rows])
         live_width = max([len("live-after")] + [len(row[1]) for row in rows])
@@ -826,21 +870,6 @@ class Compiler:
             home = f" -> {homes[location]}" if isinstance(location, Variable) else ""
             print(f"  {location}: {coloring[location]}{home}", file=sys.stderr)
         print(file=sys.stderr)
-
-    def check_variables_defined(self, instructions: list[instr]) -> None:
-        defined: set[arg] = set()
-        for instruction in instructions:
-            unassigned = {
-                location for location in self.instruction_read(instruction)
-                if isinstance(location, Variable) and location not in defined
-            }
-            if unassigned:
-                names = ", ".join(sorted(str(location) for location in unassigned))
-                raise ValueError(f"Variable read before assignment: {names}")
-            defined.update(
-                location for location in self.instruction_write(instruction)
-                if isinstance(location, Variable)
-            )
 
     def color_graph(
         self, graph: dict[arg, set[arg]], coloring: dict[arg, int]
@@ -866,8 +895,8 @@ class Compiler:
     ) -> X86Program:
         if registers_cap < 1:
             raise ValueError("registers_cap must be at least 1")
-        assert isinstance(p.body, list)
-        self.check_variables_defined(p.body)
+        blocks = p.body
+        assert isinstance(blocks, dict)
         live_after = self.uncover_live(p)
         graph = self.build_interference_graph(p, live_after)
 
@@ -896,56 +925,21 @@ class Compiler:
                 tuple(COLOR_TO_REGISTER[color] for color in range(registers_cap)),
                 coloring, homes,
             )
-        p.body = [
-            Instr(
-                instruction.instr,
-                [
-                    homes[operand] if isinstance(operand, Variable) else operand
-                    for operand in instruction.args
-                ],
-            )
-            if isinstance(instruction, Instr) else instruction
-            for instruction in p.body
-        ]
-        return p
-
-    ############################################################################
-    # Assign Homes
-    ############################################################################
-
-    def assign_homes_arg(
-        self, operand: arg, homes: dict[Variable, arg]
-    ) -> arg:
-        match operand:
-            case Variable():
-                if operand not in homes:
-                    homes[operand] = Deref("rbp", -8 * (len(homes) + 1))
-                return homes[operand]
-            case _:
-                return operand
-
-    def assign_homes_instr(
-        self, instruction: instr, homes: dict[Variable, arg]
-    ) -> instr:
-        match instruction:
-            case Instr():
-                return Instr(
+        p.body = {
+            label: [
+                Instr(
                     instruction.instr,
-                    [self.assign_homes_arg(operand, homes) for operand in instruction.args],
+                    [
+                        homes[operand] if isinstance(operand, Variable) else operand
+                        for operand in instruction.args
+                    ],
                 )
-            case _:
-                return instruction
-
-    def assign_homes(self, p: X86Program) -> X86Program:
-        homes: dict[Variable, arg] = {}
-        if isinstance(p.body, dict):
-            blocks = {
-                label: [self.assign_homes_instr(i, homes) for i in instructions]
-                for label, instructions in p.body.items()
-            }
-            return X86Program(blocks, p.entries)
-        instructions = [self.assign_homes_instr(i, homes) for i in p.body]
-        return X86Program(instructions, p.entries)
+                if isinstance(instruction, Instr) else instruction
+                for instruction in instructions
+            ]
+            for label, instructions in blocks.items()
+        }
+        return p
 
     ############################################################################
     # Patch Instructions
@@ -1099,13 +1093,10 @@ def main():
     checkpoint(args, "explicate_control", explicated)
     instruction_list = compiler.select_instructions(explicated)
     checkpoint(args, "select_instructions", instruction_list)
-    if isinstance(instruction_list.body, list):
-        allocated = compiler.allocate_registers(
-            instruction_list, registers_cap=args.registers_cap,
-            debug_allocate_registers=args.debug_allocate_registers,
-        )
-    else:
-        allocated = compiler.assign_homes(instruction_list)
+    allocated = compiler.allocate_registers(
+        instruction_list, registers_cap=args.registers_cap,
+        debug_allocate_registers=args.debug_allocate_registers,
+    )
     checkpoint(args, "allocate_registers", allocated)
     patched_instructions = compiler.patch_instructions(allocated)
     checkpoint(args, "patch_instructions", patched_instructions)

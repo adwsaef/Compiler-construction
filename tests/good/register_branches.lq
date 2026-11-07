@@ -1,0 +1,18 @@
+first = input_int()
+print(first)
+second = input_int()
+print(second)
+
+choice = input_int()
+held = choice + 31
+if choice > 0:
+    then_value = 70
+    selected = then_value
+else:
+    else_value = 80
+    selected = else_value
+print(selected + held)
+
+source = input_int()
+copy = source
+print(copy)
