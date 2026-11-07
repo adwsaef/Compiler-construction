@@ -103,6 +103,8 @@ class Compiler:
                 return [ast.Expr(ast.Call(ast.Name("print"), [self.shrink_exp(value)]))]
             case ast.Assign([ast.Name(name)], value):
                 return [ast.Assign([ast.Name(name)], self.shrink_exp(value))]
+            case ast.While(orelse=orelse) if orelse:
+                raise ValueError("while ... else is not supported")
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 shrinked_test = self.shrink_exp(test)
                 shrinked_body = [
@@ -365,13 +367,13 @@ class Compiler:
                 new_body   = self.explicate_stmts(body,   goto_cont, basic_blocks)
                 new_orelse = self.explicate_stmts(orelse, goto_cont, basic_blocks)
                 return self.explicate_pred(test, new_body, new_orelse, basic_blocks)
-            case ast.While(test, body, orelse):
+            case ast.While(test, body, []):
                 loop_label = generate_name("loop")
                 goto_loop: list[stmt] = [Goto(loop_label)]
+                after_loop = self.create_block(cont, basic_blocks)
                 new_body = self.explicate_stmts(body, goto_loop, basic_blocks)
-                new_orelse = self.explicate_stmts(orelse, cont, basic_blocks)
                 basic_blocks[loop_label] = self.explicate_pred(
-                    test, new_body, new_orelse, basic_blocks
+                    test, new_body, after_loop, basic_blocks
                 )
                 return goto_loop
             case _:

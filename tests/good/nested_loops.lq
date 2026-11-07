@@ -1,0 +1,9 @@
+n = input_int()
+i = 0
+while i + 1 <= n:
+    j = 0
+    while j < input_int():
+        print(10 * i + j)
+        j = j + 1
+    i = i + 1
+print(input_int())
