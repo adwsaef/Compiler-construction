@@ -47,19 +47,19 @@ class Compiler:
 
     def shrink_exp(self, e: expr) -> expr:
         match e:
-            case ast.BoolOp(ast.And(), [left, right, *rest]):
+            case ast.BoolOp(ast.And(), values):
                 values = [
                     self.shrink_exp(value)
-                    for value in [left, right, *rest]
+                    for value in values
                 ]
                 result = values[-1]
                 for value in reversed(values[:-1]):
                     result = ast.IfExp(value, result, ast.Constant(False))
                 return result
-            case ast.BoolOp(ast.Or(), [left, right, *rest]):
+            case ast.BoolOp(ast.Or(), values):
                 values = [
                     self.shrink_exp(value)
-                    for value in [left, right, *rest]
+                    for value in values
                 ]
                 result = values[-1]
                 for value in reversed(values[:-1]):
