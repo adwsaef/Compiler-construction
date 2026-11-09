@@ -5,8 +5,7 @@ import argparse
 import sys
 from collections import deque
 
-from ast import (Constant, UnaryOp, expr, stmt, Module, Name, IfExp)
-from unittest import case
+from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
