@@ -1089,7 +1089,9 @@ class Compiler:
 
         return p
 
-
+# TODO: dopisac walidacje typów i czy funkcja zawsze zwraca i zwraca to samo
+# jakis prosty skrpyt generujacy obok kompilatora asm
+# readme dopisać, opisać typecheck tam
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
