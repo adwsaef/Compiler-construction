@@ -1,0 +1,31 @@
+a = input_int()
+b = input_int()
+c = input_int()
+d = input_int()
+score = 0
+if (a > 0 and b > 0 and c > 0) or (d > 0 and (a < b or c == 0)):
+    score = score + 1
+else:
+    score = score + 2
+if not ((a > 0 and (b > 0 or c > 0)) or (d > 0 and c < 0)):
+    score = score + 4
+else:
+    score = score + 8
+
+e = input_int()
+f = input_int()
+g = input_int()
+h = input_int()
+if ((e < 0 or f < 0) and (g == 0 or h == 0)) or (e > 0 and not (f > 0)):
+    score = score + 16
+else:
+    score = score + 32
+if ((e <= f and f != g) or (g >= h and e == 0)) and not (h < 0 or f == 0):
+    score = score + 64
+else:
+    score = score + 128
+if (h > 0 and (e < f or g == 0)) and (a > 0 or b < 0):
+    score = score + 256
+else:
+    score = score + 512
+print(score)

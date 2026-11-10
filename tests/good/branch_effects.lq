@@ -1,0 +1,48 @@
+left = input_int()
+if left > 0 and input_int() > 0:
+    print(1)
+else:
+    print(2)
+print(input_int())
+right = input_int()
+if right > 0 or input_int() > 0:
+    print(4)
+else:
+    print(8)
+print(input_int())
+left = input_int()
+if left > 0 and input_int() > 0:
+    print(16)
+else:
+    print(32)
+print(input_int())
+right = input_int()
+if right > 0 or input_int() > 0:
+    print(64)
+else:
+    print(128)
+print(input_int())
+if input_int():
+    print(256)
+else:
+    print(512)
+print(input_int())
+
+gate = input_int()
+base = input_int()
+first = (input_int() + base) if gate > 0 else 0
+print(first)
+print(input_int())
+gate = input_int()
+second = (base + 1) if gate > 0 else (input_int() * base + input_int())
+print(second)
+print(input_int())
+print(5 + (10 if gate > 0 else 20))
+if (gate > 0 if base < 0 else gate < 0):
+    print(1)
+else:
+    print(0)
+if input_int() + 1 > 0:
+    print(1)
+else:
+    print(0)

@@ -21,6 +21,7 @@ import ast
 import sys
 from typing import Callable, TextIO
 
+from cif import CProgram
 from x86_ast import (
     ByteReg, Callq, Deref, Global, Immediate, IndirectCallq, IndirectJump,
     Instr, Jump, JumpIf, Reg, Variable, X86Def, X86Program, arg, instr,
@@ -799,13 +800,14 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
     return machine.run(max_steps)
 
 
-def interp_x86(prog: Program | ast.Module, **kwargs) -> list[int] | None:
-    """Print a Python module, or interpret an x86 program."""
+def interp_x86(prog: Program | ast.Module | CProgram, **kwargs) -> list[int] | None:
+    """Print the program, and interpret it when it is x86."""
     match prog:
-        case ast.Module():
-            print(ast.unparse(ast.fix_missing_locations(prog)))
+        case ast.Module() | CProgram():
+            print(prog)
             return None
         case _:
+            print(prog, file=sys.stderr)
             return run(blocks_of(prog), **kwargs)
 
 
@@ -815,8 +817,8 @@ def interp_x86(prog: Program | ast.Module, **kwargs) -> list[int] | None:
 # finished program, and a --interp-after PASS that runs an intermediate one.
 # They live here so that there is one implementation rather than five.
 
-PASSES = ['remove_complex_operands', 'select_instructions', 'allocate_registers', 'patch_instructions',
-          'prelude_and_conclusion']
+PASSES = ['shrink', 'remove_complex_operands', 'explicate_control', 'select_instructions', 'allocate_registers',
+          'patch_instructions', 'prelude_and_conclusion']
 
 
 def add_arguments(parser) -> None:
@@ -830,7 +832,7 @@ def add_arguments(parser) -> None:
                              'then stop: ' + ', '.join(PASSES))
 
 
-def checkpoint(args, pass_name: str, prog: Program | ast.Module) -> None:
+def checkpoint(args, pass_name: str, prog: Program | ast.Module | CProgram) -> None:
     """Interpret and stop, if --interp-after named this pass.
 
     Called after each back-end pass.  Interpreting between passes is what

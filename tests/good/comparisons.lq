@@ -1,0 +1,38 @@
+x = input_int()
+y = input_int()
+large = input_int()
+x = x
+print(x == y)
+print(x != large)
+print(x < large)
+print(large <= x)
+print(large > x)
+print(y >= x)
+
+print(not (x == y))
+print(not (x != large))
+print(not (x < large))
+print(not (large <= x))
+print(not (large > x))
+print(not (y >= x))
+flag = x < large
+flag = not flag
+print(flag)
+
+if x < 1099511627776:
+    print(1)
+else:
+    print(0)
+if 1099511627776 < large:
+    print(1)
+else:
+    print(0)
+
+print(1 < 2)
+print(2 > 1)
+print(1099511627776 < 1099511627777)
+print(1099511627777 < 1099511627776)
+print(1099511627777 >= 1099511627777)
+print(-1099511627776 < x)
+print(True)
+print(False)
