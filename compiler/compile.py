@@ -5,6 +5,7 @@ import argparse
 import sys
 from collections import deque
 from copy import replace
+from dataclasses import dataclass
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
@@ -18,7 +19,6 @@ Binding = tuple[Name, expr]
 Temporaries = list[Binding]
 
 SCRATCH_REGISTER = Reg("rax")
-RESERVED_FUNCTION_ARITY = {"input_int": 0, "print": 1, "main": 0}
 COMPARISON_OPERATORS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 ARGUMENT_REGISTERS = (
     Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
@@ -41,6 +41,33 @@ REGISTER_TO_COLOR = {register: color for color, register in COLOR_TO_REGISTER.it
 AVAILABLE_REGISTER_COUNT = sum(color >= 0 for color in COLOR_TO_REGISTER)
 
 
+ScalarTypes = frozenset[type[int]]
+TypeEnvironment = dict[str, ScalarTypes]
+INT_TYPE: ScalarTypes = frozenset({int})
+BOOL_TYPE: ScalarTypes = frozenset({bool})
+SCALAR_TYPES = INT_TYPE | BOOL_TYPE
+NO_TYPES: ScalarTypes = frozenset()
+
+
+@dataclass
+class Signature:
+    parameters: dict[str, ScalarTypes]
+    result: ScalarTypes
+
+
+@dataclass
+class TypeScope:
+    functions: dict[str, Signature]
+    variables: TypeEnvironment
+    function_name: str
+
+
+BUILTINS = {
+    "input_int": Signature({}, INT_TYPE),
+    "print": Signature({"value": SCALAR_TYPES}, NO_TYPES),
+}
+
+
 def function_label(name: str) -> str:
     if name in RUNTIME or name in NOT_MODELLED:
         return f"fun.{name}"
@@ -48,6 +75,187 @@ def function_label(name: str) -> str:
 
 
 class Compiler:
+
+    ############################################################################
+    # Split Module
+    ############################################################################
+
+    def split_module(self, p: Module) -> FunProgram[ast.FunctionDef]:
+        definitions: dict[str, ast.FunctionDef] = {}
+        main_body: list[stmt] = []
+        for statement in p.body:
+            match statement:
+                case ast.FunctionDef(name=name):
+                    if name == "main" or name in BUILTINS:
+                        raise ValueError(f"Reserved function name: {name}")
+                    if name in definitions:
+                        raise ValueError(f"Duplicate function definition: {name}")
+                    definitions[name] = statement
+                case ast.Import() | ast.ImportFrom():
+                    pass
+                case _:
+                    main_body.append(statement)
+        main_body.append(ast.Return(ast.Constant(0)))
+        definitions["main"] = ast.FunctionDef(
+            name="main", args=ast.arguments(), body=main_body, returns=ast.Name(id="int"),
+        )
+        return FunProgram(list(definitions.values()))
+
+    ############################################################################
+    # Type Check
+    ############################################################################
+
+    def annotation_type(self, annotation: expr | None, location: str) -> ScalarTypes:
+        match annotation:
+            case ast.Name("int"):
+                return INT_TYPE
+            case ast.Name("bool"):
+                return BOOL_TYPE
+            case None:
+                raise TypeError(f"Missing type annotation for {location}")
+            case _:
+                raise TypeError(f"Unsupported type annotation '{annotation}'")
+
+    def variable_type(self, name: str, scope: TypeScope) -> ScalarTypes:
+        if name in scope.functions:
+            raise TypeError(f"Function name '{name}' cannot be used as a variable")
+        declared = scope.variables.get(name)
+        if declared is None:
+            raise TypeError(f"Missing type annotation for variable '{name}'")
+        return declared
+
+    def require_type(
+        self, actual: ScalarTypes, expected: ScalarTypes, location: str,
+    ) -> None:
+        if actual == NO_TYPES:
+            raise TypeError(f"{location} requires a value")
+        if actual - expected:
+            expected_name = " or ".join(sorted(t.__name__ for t in expected))
+            actual_names = " or ".join(sorted(t.__name__ for t in actual))
+            raise TypeError(f"{location} expects {expected_name}, got {actual_names}")
+
+    def type_check_call(self, name: str, arguments: list[expr], scope: TypeScope) -> ScalarTypes:
+        signature = scope.functions.get(name)
+        if signature is None:
+            raise TypeError(f"Unknown function '{name}'")
+        arity = len(signature.parameters)
+        if len(arguments) != arity:
+            raise TypeError(f"Function '{name}' expects {arity} arguments, got {len(arguments)}")
+
+        for index, (argument, expected) in enumerate(zip(arguments, signature.parameters.values()), 1):
+            received = self.type_check_exp(argument, scope)
+            self.require_type(received, expected, f"Argument {index} of '{name}'")
+        return signature.result
+
+    def type_check_exp(self, e: expr, scope: TypeScope) -> ScalarTypes:
+        match e:
+            case ast.Constant(int() as value):
+                return BOOL_TYPE if isinstance(value, bool) else INT_TYPE
+            case ast.Name(name):
+                return self.variable_type(name, scope)
+            case ast.UnaryOp(ast.Not(), operand):
+                self.require_type(self.type_check_exp(operand, scope), BOOL_TYPE, "Operand of 'not'")
+                return BOOL_TYPE
+            case ast.UnaryOp(ast.USub(), operand):
+                self.require_type(self.type_check_exp(operand, scope), INT_TYPE, "Operand of unary '-'")
+                return INT_TYPE
+            case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
+                for operand in (left, right):
+                    self.require_type(self.type_check_exp(operand, scope), INT_TYPE, "Arithmetic operand")
+                return INT_TYPE
+            case ast.BoolOp(ast.And() | ast.Or(), values):
+                for operand in values:
+                    self.require_type(self.type_check_exp(operand, scope), BOOL_TYPE, "Boolean operand")
+                return BOOL_TYPE
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
+                left_type = self.type_check_exp(left, scope)
+                right_type = self.type_check_exp(right, scope)
+                if isinstance(op, (ast.Eq, ast.NotEq)):
+                    self.require_type(left_type, SCALAR_TYPES, "Left operand of equality comparison")
+                    self.require_type(right_type, left_type, "Right operand of equality comparison")
+                else:
+                    self.require_type(left_type, INT_TYPE, "Left operand of ordering comparison")
+                    self.require_type(right_type, INT_TYPE, "Right operand of ordering comparison")
+                return BOOL_TYPE
+            case ast.IfExp(test, body, orelse):
+                self.require_type(self.type_check_exp(test, scope), BOOL_TYPE, "Condition")
+                body_type = self.type_check_exp(body, scope)
+                else_type = self.type_check_exp(orelse, scope)
+                self.require_type(body_type, SCALAR_TYPES, "Then branch of conditional expression")
+                self.require_type(else_type, body_type, "Else branch of conditional expression")
+                return body_type
+
+            case ast.Call(ast.Name(name), arguments, []):
+                return self.type_check_call(name, arguments, scope)
+            case _:
+                raise TypeError(f"Expected a scalar expression, got {e}")
+
+    def type_check_stmt(self, statement: stmt, scope: TypeScope) -> None:
+        match statement:
+            case ast.AnnAssign(ast.Name(), _, None):
+                pass
+            case ast.Assign([ast.Name(name)], value) | ast.AnnAssign(ast.Name(name), _, ast.expr() as value):
+                declared = self.variable_type(name, scope)
+                self.require_type(self.type_check_exp(value, scope), declared, f"Variable '{name}'")
+            case ast.Expr(ast.Call() as call):
+                self.type_check_exp(call, scope)
+            case ast.Return(ast.expr() as value):
+                expected = scope.functions[scope.function_name].result
+                self.require_type(self.type_check_exp(value, scope), expected, f"Return from '{scope.function_name}'")
+            case ast.If(test, body, orelse) | ast.While(test, body, [] as orelse):
+                self.require_type(self.type_check_exp(test, scope), BOOL_TYPE, "Condition")
+                self.type_check_stmts(body, scope)
+                self.type_check_stmts(orelse, scope)
+            case _:
+                raise TypeError(f"Unexpected statement during type checking: {statement}")
+
+    def type_check_stmts(self, statements: list[stmt], scope: TypeScope) -> None:
+        for statement in statements:
+            self.type_check_stmt(statement, scope)
+
+    def can_reach_end(self, statements: list[stmt]) -> bool:
+        for statement in statements:
+            match statement:
+                case ast.Return():
+                    return False
+                case ast.If(_, body, orelse):
+                    if not self.can_reach_end(body) and not self.can_reach_end(orelse):
+                        return False
+        return True
+
+    def type_check_def(self, name: str, body: list[stmt], signatures: dict[str, Signature]) -> None:
+        signature = signatures[name]
+        variables = signature.parameters.copy()
+        for node in ast.walk(Module(body, [])):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                variable = node.target.id
+                declared = self.annotation_type(node.annotation, f"variable '{variable}'")
+                if variables.setdefault(variable, declared) != declared:
+                    raise TypeError(f"Conflicting type annotations for '{variable}'")
+        for variable in variables.keys() & signatures.keys():
+            raise TypeError(f"Function name '{variable}' cannot be used as a variable")
+
+        # Declared variables with types and function signatures.
+        scope = TypeScope(signatures, variables, name)
+
+        self.type_check_stmts(body, scope)
+
+        if self.can_reach_end(body):
+            raise TypeError(f"Function '{name}' can reach the end without returning a value")
+
+    def type_check(self, p: FunProgram[ast.FunctionDef]) -> None:
+        signatures = BUILTINS.copy()
+        for definition in p.defs:
+            name = definition.name
+            parameters = {
+                arg.arg: self.annotation_type(arg.annotation, f"parameter '{arg.arg}' in '{name}'")
+                for arg in definition.args.args
+            }
+            result = self.annotation_type(definition.returns, f"return value of '{name}'")
+            signatures[name] = Signature(parameters, result)
+
+        for definition in p.defs:
+            self.type_check_def(definition.name, definition.body, signatures)
 
     ############################################################################
     # Shrink
@@ -86,7 +294,7 @@ class Compiler:
             case _:
                 raise Exception(f"Unexpected expression during shrink: {e}")
 
-    def shrink_stmt(self, s: stmt) -> stmt:
+    def shrink_stmt(self, s: stmt) -> stmt | None:
         match s:
             case (
                 ast.Expr(ast.Call() as value)
@@ -94,6 +302,10 @@ class Compiler:
                 | ast.Return(ast.expr() as value)
             ):
                 return replace(s, value=self.shrink_exp(value))
+            case ast.AnnAssign(ast.Name() as target, _, value):
+                if value is None:
+                    return None
+                return ast.Assign([target], self.shrink_exp(value))
             case ast.While(orelse=orelse) if orelse:
                 raise ValueError("while ... else is not supported")
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
@@ -107,7 +319,12 @@ class Compiler:
                 raise Exception(f"Unexpected statement during shrink: {s}")
 
     def shrink_stmts(self, statements: list[stmt]) -> list[stmt]:
-        return [self.shrink_stmt(statement) for statement in statements]
+        shrunk_statements: list[stmt] = []
+        for statement in statements:
+            shrunk = self.shrink_stmt(statement)
+            if shrunk is not None:
+                shrunk_statements.append(shrunk)
+        return shrunk_statements
 
     def shrink_def(self, definition: ast.FunctionDef) -> FunDef:
         name = definition.name
@@ -131,27 +348,8 @@ class Compiler:
 
         return FunDef(name, params, self.shrink_stmts(definition.body))
 
-    def shrink(self, p: Module) -> FunProgram:
-        defs: list[FunDef] = []
-        function_names: set[str] = set()
-        main_body: list[stmt] = []
-        for statement in p.body:
-            match statement:
-                case ast.FunctionDef(name=name):
-                    if name in RESERVED_FUNCTION_ARITY:
-                        raise ValueError(f"Reserved function name: {name}")
-                    if name in function_names:
-                        raise ValueError(f"Duplicate function definition: {name}")
-                    function_names.add(name)
-                    defs.append(self.shrink_def(statement))
-                case ast.Import() | ast.ImportFrom():
-                    pass
-                case _:
-                    main_body.append(self.shrink_stmt(statement))
-
-        main_body.append(ast.Return(ast.Constant(0)))
-        defs.append(FunDef("main", [], main_body))
-        return FunProgram(defs)
+    def shrink(self, p: FunProgram[ast.FunctionDef]) -> FunProgram:
+        return FunProgram([self.shrink_def(definition) for definition in p.defs])
 
     ############################################################################
     # Remove Complex Operands
@@ -159,7 +357,7 @@ class Compiler:
 
     def temporary_assignments(self, temporaries: Temporaries) -> list[stmt]:
         return [
-            ast.Assign([ast.Name(name.id, ast.Store())], initializer)
+            ast.Assign([name], initializer)
             for name, initializer in temporaries
         ]
 
@@ -1103,6 +1301,7 @@ class Compiler:
             blocks.update(self.add_function_frame(definition))
         return X86Program(blocks, frozenset(d.name for d in definitions))
 
+
 # TODO: Write the compiler README.
 def main():
     parser = argparse.ArgumentParser()
@@ -1120,14 +1319,15 @@ def main():
         module = ast.parse(file.read())
 
     compiler = Compiler()
-
-    shrinked = compiler.shrink(module)
+    program = compiler.split_module(module)
+    compiler.type_check(program)
+    checkpoint(args, "type_check", module)
+    shrinked = compiler.shrink(program)
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)
     assert compiler.is_anf(simplified), \
         f"The AST is not in A-normal form:\n{simplified}"
     checkpoint(args, "remove_complex_operands", simplified)
-    # TODO: Add type checking after RCO and reject function names used as variables.
     explicated = compiler.explicate_control(simplified)
     checkpoint(args, "explicate_control", explicated)
     instruction_list = compiler.select_instructions(explicated)

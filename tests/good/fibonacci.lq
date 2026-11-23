@@ -1,10 +1,10 @@
-n = input_int()
-index = 0
-current = 0
-following = 1
+n: int = input_int()
+index: int = 0
+current: int = 0
+following: int = 1
 while index < n:
     print(current)
-    next_value = current + following
+    next_value: int = current + following
     current = following
     following = next_value
     index = index + 1

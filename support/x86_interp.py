@@ -803,7 +803,10 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
 def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | None:
     """Print the program, and interpret it when it is x86."""
     match prog:
-        case ast.Module() | CProgram() | FunProgram() | CFunProgram():
+        case ast.Module():
+            print(ast.unparse(prog))
+            return None
+        case CProgram() | FunProgram() | CFunProgram():
             print(prog)
             return None
         case _:
@@ -818,7 +821,7 @@ def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | Non
 # finished program, and a --interp-after PASS that runs an intermediate one.
 # They live here so that there is one implementation rather than five.
 
-PASSES = ['shrink', 'remove_complex_operands', 'explicate_control', 'select_instructions', 'allocate_registers',
+PASSES = ['type_check', 'shrink', 'remove_complex_operands', 'explicate_control', 'select_instructions', 'allocate_registers',
           'patch_instructions', 'prelude_and_conclusion']
 
 

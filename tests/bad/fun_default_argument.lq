@@ -1,4 +1,4 @@
-def identity(n=42):
+def identity(n: int = 42) -> int:
     return n
 
-print(identity())
+print(identity(42))

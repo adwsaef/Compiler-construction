@@ -1,10 +1,10 @@
-def add_large(n):
+def add_large(n: int) -> int:
     return n + 4294967296
 
-def subtract_large(n):
+def subtract_large(n: int) -> int:
     return n - 4294967296
 
-def constant_sum():
+def constant_sum() -> int:
     return 9223372036854775807 + 4294967296
 
 print(add_large(123))

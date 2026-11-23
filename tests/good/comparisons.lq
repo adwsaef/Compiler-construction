@@ -1,6 +1,6 @@
-x = input_int()
-y = input_int()
-large = input_int()
+x: int = input_int()
+y: int = input_int()
+large: int = input_int()
 x = x
 print(x == y)
 print(x != large)
@@ -15,7 +15,7 @@ print(not (x < large))
 print(not (large <= x))
 print(not (large > x))
 print(not (y >= x))
-flag = x < large
+flag: bool = x < large
 flag = not flag
 print(flag)
 

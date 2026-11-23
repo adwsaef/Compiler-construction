@@ -1,16 +1,16 @@
-def f(n):
+def f(n: int) -> int:
     return n + 1
 
-def f_start(n):
+def f_start(n: int) -> int:
     return f(n) + 2
 
-def f_start_start(n):
+def f_start_start(n: int) -> int:
     return f_start(n)
 
-def print_int(n):
+def print_int(n: int) -> int:
     return f_start_start(n) + 3
 
-def main_conclusion():
+def main_conclusion() -> int:
     return print_int(36)
 
 print(main_conclusion())

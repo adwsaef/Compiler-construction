@@ -1,16 +1,16 @@
-def fib(n):
+def fib(n: int) -> int:
     if n <= 1:
         return n
     else:
         return fib(n - 1) + fib(n - 2)
 
-def even(n):
+def even(n: int) -> bool:
     return True if n == 0 else odd(n - 1)
 
-def odd(n):
+def odd(n: int) -> bool:
     return False if n == 0 else even(n - 1)
 
-n = fib(10)
+n: int = fib(10)
 print(n)
 print(1 if even(n) else 0)
 print(1 if odd(n) else 0)

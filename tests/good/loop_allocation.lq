@@ -1,9 +1,9 @@
-n = input_int()
-a = input_int()
-b = input_int()
-c = input_int()
-d = input_int()
-e = input_int()
+n: int = input_int()
+a: int = input_int()
+b: int = input_int()
+c: int = input_int()
+d: int = input_int()
+e: int = input_int()
 while n > 0:
     a = a + input_int()
     b = b + 1
