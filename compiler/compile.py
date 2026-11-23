@@ -518,19 +518,23 @@ class Compiler:
                     Instr("negq", [target]),
                 ]
 
-            case ast.BinOp(left, (ast.Add() | ast.Sub()) as operator, right):
+            case ast.BinOp(left, ast.Add(), right):
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
-                subtract = isinstance(operator, ast.Sub)
-                mnemonic = "subq" if subtract else "addq"
-
                 if left_arg == target:
-                    return [Instr(mnemonic, [right_arg, target])]
+                    return [Instr("addq", [right_arg, target])]
                 if right_arg == target:
-                    if subtract:
-                        return [Instr("negq", [target]), Instr("addq", [left_arg, target])]
                     return [Instr("addq", [left_arg, target])]
-                return [Instr("movq", [left_arg, target]), Instr(mnemonic, [right_arg, target])]
+                return [Instr("movq", [left_arg, target]), Instr("addq", [right_arg, target])]
+
+            case ast.BinOp(left, ast.Sub(), right):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if left_arg == target:
+                    return [Instr("subq", [right_arg, target])]
+                if right_arg == target:
+                    return [Instr("negq", [target]), Instr("addq", [left_arg, target])]
+                return [Instr("movq", [left_arg, target]), Instr("subq", [right_arg, target])]
 
             case ast.BinOp(left, ast.Mult(), right):
                 left_arg = self.select_arg(left)
