@@ -1,0 +1,12 @@
+def choose(flag: bool) -> int:
+    if flag:
+        return 1
+
+print(choose(False))
+print(choose(True))
+
+def is_positive(n: int) -> bool:
+    if n > 0:
+        return True
+
+print(is_positive(0))

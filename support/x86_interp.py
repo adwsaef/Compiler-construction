@@ -21,6 +21,8 @@ import ast
 import sys
 from typing import Callable, TextIO
 
+from ast_utils import to_signed
+from interp_lfun import interp_lfun
 from cfun import CFunProgram, FunProgram
 from cif import CProgram
 from x86_ast import (
@@ -84,10 +86,6 @@ NOT_MODELLED = {
 
 class InterpError(Exception):
     """Anything the interpreter refuses to do, with a reason."""
-
-
-def to_signed(x: int) -> int:
-    return ((x + (1 << 63)) & MASK64) - (1 << 63)
 
 
 def sign(x: int) -> str:
@@ -801,12 +799,11 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
 
 
 def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | None:
-    """Print the program, and interpret it when it is x86."""
+    """Interpret an Lfun or x86 program at a compiler checkpoint."""
     match prog:
-        case ast.Module():
-            print(ast.unparse(prog))
-            return None
-        case CProgram() | FunProgram() | CFunProgram():
+        case ast.Module() | FunProgram() | CFunProgram():
+            return interp_lfun(prog, **kwargs)
+        case CProgram():
             print(prog)
             return None
         case _:

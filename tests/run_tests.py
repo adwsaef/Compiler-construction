@@ -33,14 +33,18 @@ def check_output(name, result, expected):
     )
 
 
-def run_good(source):
+def run_good(source, *flags):
     input_text = source.with_suffix(".in").read_text() \
         if source.with_suffix(".in").exists() else ""
     expected = source.with_suffix(".out").read_text()
 
+    for stage in ("type_check", "shrink", "remove_complex_operands", "explicate_control"):
+        result = run([sys.executable, str(COMPILER), str(source), *flags, "--interp-after", stage], input_text)
+        check_output(f"{source.name} after {stage}", result, expected)
+
     for mode, options in REGISTER_MODES:
         interpreted = run(
-            [sys.executable, str(COMPILER), str(source), *options, "--interp"],
+            [sys.executable, str(COMPILER), str(source), *flags, *options, "--interp"],
             input_text,
         )
         check_output(f"{source.name} {mode} interpreter", interpreted, expected)
@@ -51,7 +55,7 @@ def run_good(source):
             executable = directory / source.stem
 
             compiled = run([
-                sys.executable, str(COMPILER), str(source), str(assembly), *options
+                sys.executable, str(COMPILER), str(source), str(assembly), *flags, *options
             ])
             assert compiled.returncode == 0, (
                 f"{source.name} {mode} compilation failed:\n{compiled.stderr}"
@@ -69,6 +73,16 @@ def run_good(source):
 
 
 def run_bad(source):
+    function_errors = {
+        "fun_name_as_value.lq": "Function name 'answer' cannot be used as a variable",
+        "fun_wrong_arity.lq": "Function 'add' expects 2 arguments, got 1",
+        "fun_unknown_function.lq": "Unknown function 'missing'",
+    }
+    if source.name in function_errors:
+        for flags in ([], ["--no-type-check"]):
+            result = run([sys.executable, str(COMPILER), str(source), *flags])
+            assert result.returncode != 0 and function_errors[source.name] in result.stderr, result.stderr
+
     for mode, options in REGISTER_MODES:
         interpreted = run([
             sys.executable, str(COMPILER), str(source), *options, "--interp"
@@ -92,6 +106,8 @@ def run_bad(source):
 def main():
     for source in sorted((TESTS / "good").glob("*.lq")):
         run_good(source)
+    for source in sorted((TESTS / "untyped").glob("*.lq")):
+        run_good(source, "--no-type-check")
     for source in sorted((TESTS / "bad").glob("*.lq")):
         run_bad(source)
     print("All tests passed")

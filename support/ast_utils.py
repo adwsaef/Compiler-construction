@@ -26,6 +26,10 @@ def dedent():
     global indent_amount
     indent_amount -= 2
 
+def to_signed(x: int) -> int:
+    return ((x + (1 << 63)) & ((1 << 64) - 1)) - (1 << 63)
+
+
 def label_name(n: str) -> str:
     if sys.platform == "darwin":
         return '_' + n

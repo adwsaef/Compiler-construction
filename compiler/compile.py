@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
-from cfun import CFunDef, CFunProgram, FunDef, FunProgram  # type: ignore[import-untyped]
+from cfun import CFunDef, CFunProgram, FunDef, FunProgram, split_module  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Def, X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
@@ -75,31 +75,72 @@ def function_label(name: str) -> str:
 
 
 class Compiler:
-
     ############################################################################
     # Split Module
     ############################################################################
 
     def split_module(self, p: Module) -> FunProgram[ast.FunctionDef]:
-        definitions: dict[str, ast.FunctionDef] = {}
-        main_body: list[stmt] = []
-        for statement in p.body:
-            match statement:
-                case ast.FunctionDef(name=name):
-                    if name == "main" or name in BUILTINS:
-                        raise ValueError(f"Reserved function name: {name}")
-                    if name in definitions:
-                        raise ValueError(f"Duplicate function definition: {name}")
-                    definitions[name] = statement
-                case ast.Import() | ast.ImportFrom():
-                    pass
-                case _:
-                    main_body.append(statement)
-        main_body.append(ast.Return(ast.Constant(0)))
-        definitions["main"] = ast.FunctionDef(
-            name="main", args=ast.arguments(), body=main_body, returns=ast.Name(id="int"),
-        )
-        return FunProgram(list(definitions.values()))
+        return split_module(p, reserved=BUILTINS)
+
+    ############################################################################
+    # Check Functions
+    ############################################################################
+
+    def function_arity(self, definition: ast.FunctionDef) -> int:
+        name = definition.name
+        if definition.decorator_list or definition.type_params:
+            raise ValueError(f"Decorators and type parameters are not supported: {name}")
+
+        args = definition.args
+        if (
+            args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg
+            or args.defaults or args.kw_defaults
+        ):
+            raise NotImplementedError(f"{name} only supports ordinary parameters without defaults")
+        params = [parameter.arg for parameter in args.args]
+
+        if len(set(params)) != len(params):
+            raise ValueError(f"Duplicate parameter in function: {name}")
+
+        max_parameters = len(ARGUMENT_REGISTERS)
+        if len(params) > max_parameters:
+            raise ValueError(f"{name} supports at most {max_parameters} parameters")
+
+        return len(params)
+
+    def check_function_uses(self, node: ast.AST, arities: dict[str, int]) -> None:
+        match node:
+            case ast.Name(name) | ast.arg(name):
+                if name in arities:
+                    raise TypeError(f"Function name '{name}' cannot be used as a variable")
+            case ast.Call(ast.Name(name), arguments, []):
+                if name not in arities:
+                    raise TypeError(f"Unknown function '{name}'")
+                arity = arities[name]
+                if len(arguments) != arity:
+                    raise TypeError(f"Function '{name}' expects {arity} arguments, got {len(arguments)}")
+                for argument in arguments:
+                    self.check_function_uses(argument, arities)
+            case ast.Call():
+                raise TypeError("Only direct calls with positional arguments are supported")
+            case ast.AnnAssign(target, _, value):
+                self.check_function_uses(target, arities)
+                if value is not None:
+                    self.check_function_uses(value, arities)
+            case _:
+                for child in ast.iter_child_nodes(node):
+                    self.check_function_uses(child, arities)
+
+    def check_functions(self, p: FunProgram[ast.FunctionDef]) -> None:
+        arities = {name: len(sig.parameters) for name, sig in BUILTINS.items()}
+        for definition in p.defs:
+            arities[definition.name] = self.function_arity(definition)
+
+        for definition in p.defs:
+            for parameter in definition.args.args:
+                self.check_function_uses(parameter, arities)
+            for statement in definition.body:
+                self.check_function_uses(statement, arities)
 
     ############################################################################
     # Type Check
@@ -117,8 +158,6 @@ class Compiler:
                 raise TypeError(f"Unsupported type annotation '{annotation}'")
 
     def variable_type(self, name: str, scope: TypeScope) -> ScalarTypes:
-        if name in scope.functions:
-            raise TypeError(f"Function name '{name}' cannot be used as a variable")
         declared = scope.variables.get(name)
         if declared is None:
             raise TypeError(f"Missing type annotation for variable '{name}'")
@@ -135,13 +174,7 @@ class Compiler:
             raise TypeError(f"{location} expects {expected_name}, got {actual_names}")
 
     def type_check_call(self, name: str, arguments: list[expr], scope: TypeScope) -> ScalarTypes:
-        signature = scope.functions.get(name)
-        if signature is None:
-            raise TypeError(f"Unknown function '{name}'")
-        arity = len(signature.parameters)
-        if len(arguments) != arity:
-            raise TypeError(f"Function '{name}' expects {arity} arguments, got {len(arguments)}")
-
+        signature = scope.functions[name]
         for index, (argument, expected) in enumerate(zip(arguments, signature.parameters.values()), 1):
             received = self.type_check_exp(argument, scope)
             self.require_type(received, expected, f"Argument {index} of '{name}'")
@@ -213,16 +246,6 @@ class Compiler:
         for statement in statements:
             self.type_check_stmt(statement, scope)
 
-    def can_reach_end(self, statements: list[stmt]) -> bool:
-        for statement in statements:
-            match statement:
-                case ast.Return():
-                    return False
-                case ast.If(_, body, orelse):
-                    if not self.can_reach_end(body) and not self.can_reach_end(orelse):
-                        return False
-        return True
-
     def type_check_def(self, name: str, body: list[stmt], signatures: dict[str, Signature]) -> None:
         signature = signatures[name]
         variables = signature.parameters.copy()
@@ -232,16 +255,10 @@ class Compiler:
                 declared = self.annotation_type(node.annotation, f"variable '{variable}'")
                 if variables.setdefault(variable, declared) != declared:
                     raise TypeError(f"Conflicting type annotations for '{variable}'")
-        for variable in variables.keys() & signatures.keys():
-            raise TypeError(f"Function name '{variable}' cannot be used as a variable")
 
-        # Declared variables with types and function signatures.
         scope = TypeScope(signatures, variables, name)
 
         self.type_check_stmts(body, scope)
-
-        if self.can_reach_end(body):
-            raise TypeError(f"Function '{name}' can reach the end without returning a value")
 
     def type_check(self, p: FunProgram[ast.FunctionDef]) -> None:
         signatures = BUILTINS.copy()
@@ -327,26 +344,8 @@ class Compiler:
         return shrunk_statements
 
     def shrink_def(self, definition: ast.FunctionDef) -> FunDef:
-        name = definition.name
-        if definition.decorator_list or definition.type_params:
-            raise ValueError(f"Decorators and type parameters are not supported: {name}")
-
-        args = definition.args
-        if (
-            args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg
-            or args.defaults or args.kw_defaults
-        ):
-            raise NotImplementedError(f"{name} only supports ordinary parameters without defaults")
-        params = [parameter.arg for parameter in args.args]
-
-        if len(set(params)) != len(params):
-            raise ValueError(f"Duplicate parameter in function: {name}")
-
-        max_parameters = len(ARGUMENT_REGISTERS)
-        if len(params) > max_parameters:
-            raise ValueError(f"{name} supports at most {max_parameters} parameters")
-
-        return FunDef(name, params, self.shrink_stmts(definition.body))
+        params = [arg.arg for arg in definition.args.args]
+        return FunDef(definition.name, params, self.shrink_stmts(definition.body))
 
     def shrink(self, p: FunProgram[ast.FunctionDef]) -> FunProgram:
         return FunProgram([self.shrink_def(definition) for definition in p.defs])
@@ -672,7 +671,7 @@ class Compiler:
         definitions: list[CFunDef] = []
         for definition in p.defs:
             basic_blocks: BasicBlocks = {}
-            basic_blocks[function_label(definition.name)] = self.explicate_stmts(
+            basic_blocks[definition.name] = self.explicate_stmts(
                 definition.body, [ast.Return(ast.Constant(0))], basic_blocks,
             )
             definitions.append(CFunDef(definition.name, definition.params, basic_blocks))
@@ -909,7 +908,7 @@ class Compiler:
             name = function_label(definition.name)
             conclusion = f"{name}.conclusion"
             blocks: dict[str, list[instr]] = {
-                label: [
+                (name if label == definition.name else label): [
                     instruction
                     for statement in statements
                     for instruction in self.select_stmt(statement, conclusion)
@@ -1302,11 +1301,11 @@ class Compiler:
         return X86Program(blocks, frozenset(d.name for d in definitions))
 
 
-# TODO: Write the compiler README.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("output", nargs="?")
+    parser.add_argument("--no-type-check", action="store_true", help="skip source type checking")
     parser.add_argument("--debug-allocate-registers", action="store_true", help="print live-after sets, added edges, colors, and homes")
     parser.add_argument(
         "--registers-cap", type=int, default=AVAILABLE_REGISTER_COUNT,
@@ -1320,8 +1319,10 @@ def main():
 
     compiler = Compiler()
     program = compiler.split_module(module)
-    compiler.type_check(program)
-    checkpoint(args, "type_check", module)
+    compiler.check_functions(program)
+    if not args.no_type_check:
+        compiler.type_check(program)
+    checkpoint(args, "type_check", program)
     shrinked = compiler.shrink(program)
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)

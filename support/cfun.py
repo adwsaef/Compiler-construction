@@ -8,7 +8,9 @@ labelled basic blocks.  They are separate classes rather than one reused
 `Begin` and `Goto` still come from cif.py -- explicate_control's output
 language is unchanged apart from being per function.
 """
+import ast
 from ast import FunctionDef, stmt
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from ast_utils import dedent, indent
@@ -39,6 +41,28 @@ class FunProgram[T: (FunctionDef, FunDef) = FunDef]:
 
     def __str__(self):
         return '\n'.join(str(d) for d in self.defs)
+
+
+def split_module(p: ast.Module, reserved: Collection[str] = ("print", "input_int")) -> FunProgram[ast.FunctionDef]:
+    definitions: dict[str, ast.FunctionDef] = {}
+    main_body: list[stmt] = []
+    for statement in p.body:
+        match statement:
+            case ast.FunctionDef(name=name):
+                if name == "main" or name in reserved:
+                    raise ValueError(f"Reserved function name: {name}")
+                if name in definitions:
+                    raise ValueError(f"Duplicate function definition: {name}")
+                definitions[name] = statement
+            case ast.Import() | ast.ImportFrom():
+                pass
+            case _:
+                main_body.append(statement)
+    main_body.append(ast.Return(ast.Constant(0)))
+    definitions["main"] = ast.FunctionDef(
+        name="main", args=ast.arguments(), body=main_body, returns=ast.Name(id="int"),
+    )
+    return FunProgram(list(definitions.values()))
 
 
 @dataclass

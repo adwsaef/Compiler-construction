@@ -1,5 +1,0 @@
-def choose(flag: bool) -> int:
-    if flag:
-        return 1
-
-print(choose(False))
