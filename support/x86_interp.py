@@ -22,7 +22,6 @@ import sys
 from typing import Callable, TextIO
 
 from ast_utils import to_signed
-from interp_lfun import interp_lfun
 from cfun import CFunProgram, FunProgram
 from cif import CProgram
 from x86_ast import (
@@ -799,11 +798,12 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
 
 
 def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | None:
-    """Interpret an Lfun or x86 program at a compiler checkpoint."""
+    """Execute x86 instructions or display an earlier intermediate form."""
     match prog:
-        case ast.Module() | FunProgram() | CFunProgram():
-            return interp_lfun(prog, **kwargs)
-        case CProgram():
+        case ast.Module():
+            print(ast.unparse(prog))
+            return None
+        case CProgram() | FunProgram() | CFunProgram():
             print(prog)
             return None
         case _:
@@ -829,7 +829,7 @@ def add_arguments(parser) -> None:
                              'writing assembly')
     parser.add_argument('--interp-after', metavar='PASS', default=None,
                         choices=PASSES,
-                        help='interpret the program as it stands after PASS, '
+                        help='display the program after PASS and execute it from select_instructions onward, '
                              'then stop: ' + ', '.join(PASSES))
 
 
@@ -842,6 +842,6 @@ def checkpoint(args, pass_name: str, prog: Program | IntermediateProgram) -> Non
     """
     if getattr(args, 'interp_after', None) != pass_name:
         return
-    print(f'# interpreting after {pass_name}', file=sys.stderr)
+    print(f'# after {pass_name}', file=sys.stderr)
     interp_x86(prog)
     raise SystemExit(0)

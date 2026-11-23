@@ -10,6 +10,6 @@ Compile to x86-64 with `uv run compiler/compile.py program.lq program.s`, or run
 - `int` and `bool` are distinct. Write `if n != 0:` for an integer condition. The checker rejects `True + 1` and `0 == False`.
 - Falling off the end of a function returns zero (`False` for a Boolean result). Explicit returns must match the declared type.
 
-Use `--interp-after type_check` to run the source or `--interp-after PASS` to run an intermediate form.
+The supplied x86 interpreter can run functions from `--interp-after select_instructions` onward. Earlier checkpoints print the intermediate form.
 
 When both multiplication operands are integer constants, the compiler rejects products outside the signed 64-bit range. Runtime multiplication wraps on overflow.

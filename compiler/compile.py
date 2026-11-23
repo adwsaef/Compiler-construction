@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
-from cfun import CFunDef, CFunProgram, FunDef, FunProgram, split_module  # type: ignore[import-untyped]
+from cfun import CFunDef, CFunProgram, FunDef, FunProgram  # type: ignore[import-untyped]
 from cif import BasicBlocks, Begin, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Def, X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
@@ -80,7 +80,25 @@ class Compiler:
     ############################################################################
 
     def split_module(self, p: Module) -> FunProgram[ast.FunctionDef]:
-        return split_module(p, reserved=BUILTINS)
+        definitions: dict[str, ast.FunctionDef] = {}
+        main_body: list[stmt] = []
+        for statement in p.body:
+            match statement:
+                case ast.FunctionDef(name=name):
+                    if name == "main" or name in BUILTINS:
+                        raise ValueError(f"Reserved function name: {name}")
+                    if name in definitions:
+                        raise ValueError(f"Duplicate function definition: {name}")
+                    definitions[name] = statement
+                case ast.Import() | ast.ImportFrom():
+                    pass
+                case _:
+                    main_body.append(statement)
+        main_body.append(ast.Return(ast.Constant(0)))
+        definitions["main"] = ast.FunctionDef(
+            name="main", args=ast.arguments(), body=main_body, returns=ast.Name(id="int"),
+        )
+        return FunProgram(list(definitions.values()))
 
     ############################################################################
     # Check Functions
@@ -1322,7 +1340,7 @@ def main():
     compiler.check_functions(program)
     if not args.no_type_check:
         compiler.type_check(program)
-    checkpoint(args, "type_check", program)
+    checkpoint(args, "type_check", module)
     shrinked = compiler.shrink(program)
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)

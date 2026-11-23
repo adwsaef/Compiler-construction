@@ -15,7 +15,7 @@ build-backend = "hatchling.build"
 # interpreter to reach x86_ast under a different name, its classes would not be
 # the compiler's classes and every "case Instr(...)" would quietly fall through.
 [tool.hatch.build.targets.wheel]
-include = ["x86_ast.py", "ast_utils.py", "graph.py", "cif.py", "cfun.py", "x86_interp.py", "interp_lfun.py"]
+include = ["x86_ast.py", "ast_utils.py", "graph.py", "cif.py", "cfun.py", "x86_interp.py"]
 
 [tool.mypy]
 check_untyped_defs = true

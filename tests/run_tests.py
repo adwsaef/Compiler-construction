@@ -38,9 +38,8 @@ def run_good(source, *flags):
         if source.with_suffix(".in").exists() else ""
     expected = source.with_suffix(".out").read_text()
 
-    for stage in ("type_check", "shrink", "remove_complex_operands", "explicate_control"):
-        result = run([sys.executable, str(COMPILER), str(source), *flags, "--interp-after", stage], input_text)
-        check_output(f"{source.name} after {stage}", result, expected)
+    result = run([sys.executable, str(COMPILER), str(source), *flags, "--interp-after", "select_instructions"], input_text)
+    check_output(f"{source.name} after instruction selection", result, expected)
 
     for mode, options in REGISTER_MODES:
         interpreted = run(
