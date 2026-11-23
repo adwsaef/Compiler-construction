@@ -12,7 +12,7 @@ from cfun import CFunDef, CFunProgram, FunDef, FunProgram  # type: ignore[import
 from cif import BasicBlocks, Begin, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Def, X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
-from x86_interp import checkpoint, add_arguments, interp_x86, to_signed # type: ignore[import-untyped]
+from x86_interp import NOT_MODELLED, RUNTIME, checkpoint, add_arguments, interp_x86, to_signed # type: ignore[import-untyped]
 
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
@@ -39,6 +39,12 @@ COLOR_TO_REGISTER = {
 }
 REGISTER_TO_COLOR = {register: color for color, register in COLOR_TO_REGISTER.items()}
 AVAILABLE_REGISTER_COUNT = sum(color >= 0 for color in COLOR_TO_REGISTER)
+
+
+def function_label(name: str) -> str:
+    if name in RUNTIME or name in NOT_MODELLED:
+        return f"fun.{name}"
+    return name
 
 
 class Compiler:
@@ -468,7 +474,7 @@ class Compiler:
         definitions: list[CFunDef] = []
         for definition in p.defs:
             basic_blocks: BasicBlocks = {}
-            basic_blocks[f"{definition.name}_start"] = self.explicate_stmts(
+            basic_blocks[function_label(definition.name)] = self.explicate_stmts(
                 definition.body, [ast.Return(ast.Constant(0))], basic_blocks,
             )
             definitions.append(CFunDef(definition.name, definition.params, basic_blocks))
@@ -581,7 +587,7 @@ class Compiler:
             case "input_int":
                 label = name
             case _:
-                label = f"{name}_start"
+                label = function_label(name)
 
         instructions: list[instr] = [
             Instr("movq", [self.select_arg(argument), register])
@@ -702,8 +708,8 @@ class Compiler:
     def select_instructions(self, p: CFunProgram) -> list[X86Def]:
         definitions: list[X86Def] = []
         for definition in p.defs:
-            name = definition.name
-            conclusion = f"{name}_conclusion"
+            name = function_label(definition.name)
+            conclusion = f"{name}.conclusion"
             blocks: dict[str, list[instr]] = {
                 label: [
                     instruction
@@ -712,13 +718,12 @@ class Compiler:
                 ]
                 for label, statements in definition.blocks.items()
             }
-            start = f"{name}_start"
             # Include the incoming moves in liveness so later arguments stay intact.
             parameter_moves: list[instr] = [
                 Instr("movq", [register, Variable(parameter)])
                 for parameter, register in zip(definition.params, ARGUMENT_REGISTERS)
             ]
-            blocks[start] = parameter_moves + blocks[start]
+            blocks[name] = parameter_moves + blocks[name]
             definitions.append(X86Def(name, blocks))
         return definitions
 
@@ -1086,18 +1091,17 @@ class Compiler:
             Instr("retq", []),
         ])
 
-        start = f"{p.name}_start"
         return {
             **p.blocks,
-            start: prologue + p.blocks[start],
-            f"{p.name}_conclusion": conclusion,
+            p.name: prologue + p.blocks[p.name],
+            f"{p.name}.conclusion": conclusion,
         }
 
     def prelude_and_conclusion(self, definitions: list[X86Def]) -> X86Program:
-        blocks: dict[str, list[instr]] = {"main": [Jump("main_start")]}
+        blocks: dict[str, list[instr]] = {}
         for definition in definitions:
             blocks.update(self.add_function_frame(definition))
-        return X86Program(blocks, frozenset(f"{d.name}_start" for d in definitions))
+        return X86Program(blocks, frozenset(d.name for d in definitions))
 
 # TODO: Write the compiler README.
 def main():

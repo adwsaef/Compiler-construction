@@ -186,9 +186,8 @@ def frame_size(code: list[instr]) -> int:
 def default_entry(blocks: dict[str, list[instr]]) -> str:
     """Where to start, when the caller has not said.
 
-    Before prelude_and_conclusion there is no `main` block -- the program's
-    own statements are in `main_start` -- so which one exists tells us how far
-    down the pipeline this program is.
+    Function programs use `main` at every x86 stage. Standalone pseudo-x86
+    programs may still name their entry block `main_start`.
     """
     for candidate in ('main', 'main_start'):
         if candidate in blocks:
@@ -787,14 +786,15 @@ class Machine:
 
 def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
         stdin: TextIO | None = None, stdout: TextIO | None = None,
-        max_steps: int = 10_000_000, heap_size: int = 1 << 20) -> list[int]:
+        max_steps: int = 10_000_000, heap_size: int = 1 << 20,
+        check_frames: bool | None = None) -> list[int]:
     """Interpret a block dictionary, returning the integers it printed."""
     if entry is None:
         entry = default_entry(blocks)
     code, labels, where = load(blocks, entry)
     machine = Machine(code, labels, where, entry,
                       stdin=stdin, stdout=stdout, heap_size=heap_size,
-                      check_frames='main' in blocks)
+                      check_frames=('main' in blocks if check_frames is None else check_frames))
     if not machine.check_frames:
         machine.build_frame()
     return machine.run(max_steps)
@@ -809,7 +809,7 @@ def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | Non
         case _:
             output = '\n'.join(map(str, prog)) if isinstance(prog, list) else prog
             print(output, file=sys.stderr)
-            return run(blocks_of(prog), **kwargs)
+            return run(blocks_of(prog), check_frames=isinstance(prog, X86Program), **kwargs)
 
 
 # ------------------------------------------------- driver-side conveniences
