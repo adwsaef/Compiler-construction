@@ -21,6 +21,7 @@ import ast
 import sys
 from typing import Callable, TextIO
 
+from cfun import CFunProgram, FunProgram
 from cif import CProgram
 from x86_ast import (
     ByteReg, Callq, Deref, Global, Immediate, IndirectCallq, IndirectJump,
@@ -140,6 +141,7 @@ UNARY: dict[str, tuple[Callable[[int], int], bool]] = {
 
 
 Program = X86Program | X86Def | list
+IntermediateProgram = ast.Module | CProgram | FunProgram | CFunProgram
 
 
 def blocks_of(prog: Program) -> dict[str, list[instr]]:
@@ -226,13 +228,8 @@ def load(blocks: dict[str, list[instr]], entry: str = 'main'
                 undefined.append(label)
             case Callq(func, _) if func not in RUNTIME \
                     and func not in NOT_MODELLED:
-                # Before prelude_and_conclusion a function has no entry
-                # block: calls name `f` while only `f_start` exists.  But a
-                # call to something that is neither is an error here rather
-                # than a jump to nowhere at run time.
-                if func in labels or func + '_start' in labels:
-                    continue
-                undefined.append(func)
+                if func not in labels:
+                    undefined.append(func)
 
     if undefined:
         message = ('undefined label(s): ' + ', '.join(sorted(set(undefined)))
@@ -540,7 +537,7 @@ class Machine:
             self.clobber_caller_saved(also_rax=True)
             self.write(Reg('rax'), value)              # ... and then returns it
             return None
-        target = self.labels.get(func, self.labels.get(func + '_start'))
+        target = self.labels.get(func)
         if target is None:
             raise self.fail(
                 f'callq {func}: no such function.\n'
@@ -559,17 +556,18 @@ class Machine:
         """
         self.push(self.regs['rbp'])
         self.regs['rbp'] = self.regs['rsp']
+        self.regs['rsp'] = to_signed(self.regs['rsp'] - self.frame_size)
         for name in CALLEE_SAVED:
             self.push(self.regs[name])
-        self.regs['rsp'] = to_signed(self.regs['rsp'] - self.frame_size)
         self.synthetic_frames += 1
 
     def tear_down_frame(self) -> None:
         """The conclusion's half: undo build_frame, in reverse."""
         self.regs['rsp'] = to_signed(
-            self.regs['rbp'] - WORD * len(CALLEE_SAVED))
+            self.regs['rbp'] - self.frame_size - WORD * len(CALLEE_SAVED))
         for name in reversed(CALLEE_SAVED):
             self.regs[name] = self.pop()
+        self.regs['rsp'] = self.regs['rbp']
         self.regs['rbp'] = self.pop()
         self.synthetic_frames -= 1
 
@@ -797,17 +795,20 @@ def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
     machine = Machine(code, labels, where, entry,
                       stdin=stdin, stdout=stdout, heap_size=heap_size,
                       check_frames='main' in blocks)
+    if not machine.check_frames:
+        machine.build_frame()
     return machine.run(max_steps)
 
 
-def interp_x86(prog: Program | ast.Module | CProgram, **kwargs) -> list[int] | None:
+def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | None:
     """Print the program, and interpret it when it is x86."""
     match prog:
-        case ast.Module() | CProgram():
+        case ast.Module() | CProgram() | FunProgram() | CFunProgram():
             print(prog)
             return None
         case _:
-            print(prog, file=sys.stderr)
+            output = '\n'.join(map(str, prog)) if isinstance(prog, list) else prog
+            print(output, file=sys.stderr)
             return run(blocks_of(prog), **kwargs)
 
 
@@ -832,7 +833,7 @@ def add_arguments(parser) -> None:
                              'then stop: ' + ', '.join(PASSES))
 
 
-def checkpoint(args, pass_name: str, prog: Program | ast.Module | CProgram) -> None:
+def checkpoint(args, pass_name: str, prog: Program | IntermediateProgram) -> None:
     """Interpret and stop, if --interp-after named this pass.
 
     Called after each back-end pass.  Interpreting between passes is what

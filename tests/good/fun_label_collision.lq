@@ -1,0 +1,16 @@
+def f(n):
+    return n + 1
+
+def f_start(n):
+    return f(n) + 2
+
+def f_start_start(n):
+    return f_start(n)
+
+def print_int(n):
+    return f_start_start(n) + 3
+
+def main_conclusion():
+    return print_int(36)
+
+print(main_conclusion())

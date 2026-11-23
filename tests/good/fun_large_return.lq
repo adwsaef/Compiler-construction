@@ -1,0 +1,12 @@
+def add_large(n):
+    return n + 4294967296
+
+def subtract_large(n):
+    return n - 4294967296
+
+def constant_sum():
+    return 9223372036854775807 + 4294967296
+
+print(add_large(123))
+print(subtract_large(123))
+print(constant_sum())

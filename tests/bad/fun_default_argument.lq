@@ -1,0 +1,4 @@
+def identity(n=42):
+    return n
+
+print(identity())

@@ -396,17 +396,13 @@ def test_pseudo_x86_runs_with_variables_and_no_homes():
 # has not run, so that this checkpoint tests the passes that have.
 
 
-def test_a_call_before_the_prelude_finds_the_start_block():
-    """Calls name f, but only f_start exists until the prelude is built."""
-    out = run_blocks({'main_start': [mov(imm(1), Reg('rdi')),
-                                     Callq('f', 1),
-                                     Jump('main_conclusion')],
-                      'f_start': [PRINT, Jump('f_conclusion')]})
-    assert out == [1]
+def test_a_call_requires_the_exact_label():
+    with pytest.raises(InterpError, match=r'undefined label\(s\): f\n'):
+        run_blocks({'main_start': [Callq('f', 0)], 'f_start': [Jump('f_conclusion')]})
 
 
 def test_a_jump_to_an_absent_conclusion_returns_rather_than_halting():
-    out = run_blocks({'main_start': [Callq('f', 0), mov(imm(2), Reg('rdi')),
+    out = run_blocks({'main_start': [Callq('f_start', 0), mov(imm(2), Reg('rdi')),
                                      PRINT, Jump('main_conclusion')],
                       'f_start': [mov(imm(1), Reg('rdi')), PRINT,
                                   Jump('f_conclusion')]})
@@ -416,7 +412,7 @@ def test_a_jump_to_an_absent_conclusion_returns_rather_than_halting():
 def test_variables_are_local_to_a_frame():
     """A recursive callee must not overwrite its caller's variables."""
     out = run_blocks({
-        'main_start': [mov(imm(2), Variable('n')), Callq('f', 0),
+        'main_start': [mov(imm(2), Variable('n')), Callq('f_start', 0),
                        mov(Variable('n'), Reg('rdi')), PRINT,
                        Jump('main_conclusion')],
         'f_start': [mov(imm(99), Variable('n')), Jump('f_conclusion')]})
@@ -436,7 +432,7 @@ def test_a_recursive_callee_does_not_overwrite_its_callers_spill_slots():
     """The frame is what the missing prelude would have allocated, so it goes
     on the stack -- if it did not, this would read f(0)'s slot, not f(2)'s."""
     out = run_blocks({
-        'main_start': [mov(imm(2), Reg('rdi')), Callq('f', 1),
+        'main_start': [mov(imm(2), Reg('rdi')), Callq('f_start', 1),
                        mov(Reg('rax'), Reg('rdi')), PRINT,
                        Jump('main_conclusion')],
         'f_start': [mov(Reg('rdi'), Deref('rbp', -8)),      # n, spilled
@@ -444,7 +440,7 @@ def test_a_recursive_callee_does_not_overwrite_its_callers_spill_slots():
                     JumpIf('e', 'f_base'),
                     mov(Deref('rbp', -8), Reg('rdi')),
                     Instr('subq', [imm(1), Reg('rdi')]),
-                    Callq('f', 1),
+                    Callq('f_start', 1),
                     # the recursive call must not have touched our slot
                     Instr('addq', [Deref('rbp', -8), Reg('rax')]),
                     Jump('f_conclusion')],
@@ -472,7 +468,7 @@ def test_the_synthetic_frame_lives_on_the_stack():
 def test_callee_saved_registers_survive_a_call_before_the_prelude():
     """The prelude would have pushed them; until it exists, we stand in."""
     out = run_blocks({
-        'main_start': [mov(imm(7), Reg('rbx')), Callq('f', 0),
+        'main_start': [mov(imm(7), Reg('rbx')), Callq('f_start', 0),
                        mov(Reg('rbx'), Reg('rdi')), PRINT,
                        Jump('main_conclusion')],
         'f_start': [mov(imm(99), Reg('rbx')), Jump('f_conclusion')]})
@@ -482,7 +478,7 @@ def test_callee_saved_registers_survive_a_call_before_the_prelude():
 def test_the_frame_check_waits_until_there_is_a_prelude():
     """%rsp alignment is what prelude_and_conclusion establishes, so there is
     nothing to check before it has run."""
-    out = run_blocks({'main_start': [Callq('f', 0), Jump('main_conclusion')],
+    out = run_blocks({'main_start': [Callq('f_start', 0), Jump('main_conclusion')],
                       'f_start': [mov(imm(1), Reg('rdi')), PRINT,
                                   Jump('f_conclusion')]})
     assert out == [1]
