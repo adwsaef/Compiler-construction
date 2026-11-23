@@ -19,6 +19,7 @@ Temporaries = list[Binding]
 SCRATCH_REGISTER = Reg("rax")
 MAIN_START = "main_start"
 MAIN_CONCLUSION = "main_conclusion"
+COMPARISON_OPERATORS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 ARGUMENT_REGISTERS = (
     Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
 )
@@ -49,19 +50,21 @@ class Compiler:
     def shrink_exp(self, e: expr) -> expr:
         match e:
             case ast.BoolOp((ast.And() | ast.Or()) as op, values):
-                values = [self.shrink_exp(value) for value in values]
-                result = values[-1]
+                if len(values) < 2:
+                    raise ValueError("A boolean operation needs at least two operands")
+                result = self.shrink_exp(values[-1])
                 for value in reversed(values[:-1]):
+                    test = self.shrink_exp(value)
                     if isinstance(op, ast.And):
-                        result = ast.IfExp(value, result, ast.Constant(False))
+                        result = ast.IfExp(test, result, ast.Constant(False))
                     else:
-                        result = ast.IfExp(value, ast.Constant(True), result)
+                        result = ast.IfExp(test, ast.Constant(True), result)
                 return result
             case ast.UnaryOp(ast.Not() | ast.USub(), operand):
                 return replace(e, operand=self.shrink_exp(operand))
             case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
                 return replace(e, left=self.shrink_exp(left), right=self.shrink_exp(right))
-            case ast.Compare(left, [_], [right]):
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
                 return replace(e, left=self.shrink_exp(left), comparators=[self.shrink_exp(right)])
             case ast.IfExp(test, body, orelse):
                 return replace(
@@ -70,15 +73,15 @@ class Compiler:
                     body=self.shrink_exp(body),
                     orelse=self.shrink_exp(orelse),
                 )
-            case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
+            case ast.Call(ast.Name("input_int"), [], []) | ast.Name() | ast.Constant():
                 return e
             case _:
                 raise Exception(f"Unexpected expression during shrink: {e}")
 
     def shrink_stmt(self, s: stmt) -> stmt:
         match s:
-            case ast.Expr(ast.Call(ast.Name("print"), [value]) as call):
-                return replace(s, value=replace(call, args=[self.shrink_exp(value)], keywords=[]))
+            case ast.Expr(ast.Call(ast.Name("print"), [value], []) as call):
+                return replace(s, value=replace(call, args=[self.shrink_exp(value)]))
             case ast.Assign([ast.Name()], value):
                 return replace(s, value=self.shrink_exp(value))
             case ast.While(orelse=orelse) if orelse:
@@ -105,7 +108,7 @@ class Compiler:
 
     def temporary_assignments(self, temporaries: Temporaries) -> list[stmt]:
         return [
-            ast.Assign([name], initializer)
+            ast.Assign([ast.Name(name.id, ast.Store())], initializer)
             for name, initializer in temporaries
         ]
 
@@ -196,21 +199,23 @@ class Compiler:
     ############################################################################
 
     def is_atom(self, e: expr) -> bool:
-        return isinstance(e, (ast.Name, ast.Constant))
+        match e:
+            case ast.Name() | ast.Constant(int()):
+                return True
+            case _:
+                return False
 
     def is_anf_exp(self, e: expr) -> bool:
         match e:
-            case ast.Constant() | ast.Name():
-                return True
-            case ast.BinOp(left, _, right):
+            case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
                 return self.is_atom(left) and self.is_atom(right)
             case ast.UnaryOp(ast.Not(), ast.Compare() as comparison):
                 return self.is_anf_exp(comparison)
-            case ast.UnaryOp(_, operand):
+            case ast.UnaryOp(ast.Not() | ast.USub(), operand):
                 return self.is_atom(operand)
-            case ast.Compare(left, [_], [right]):
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
                 return self.is_atom(left) and self.is_atom(right)
-            case ast.Call(_, arguments):
+            case ast.Call(ast.Name(), arguments, []):
                 return all(self.is_atom(argument) for argument in arguments)
             case ast.IfExp(test, body, orelse):
                 return (
@@ -223,13 +228,16 @@ class Compiler:
                     self.is_anf_stmt(statement) for statement in begin.body
                 ) and self.is_anf_exp(begin.result)
             case _:
-                return False
+                return self.is_atom(e)
 
     def is_anf_stmt(self, s: stmt) -> bool:
         match s:
-            case ast.Expr(value) | ast.Assign(_, value):
+            case (
+                ast.Expr(ast.Call(ast.Name("print"), [_], []) as value)
+                | ast.Assign([ast.Name()], value)
+            ):
                 return self.is_anf_exp(value)
-            case ast.If(test, body, orelse) | ast.While(test, body, orelse):
+            case ast.If(test, body, orelse) | ast.While(test, body, [] as orelse):
                 return (
                     self.is_anf_exp(test)
                     and all(self.is_anf_stmt(statement) for statement in body)
@@ -506,11 +514,7 @@ class Compiler:
                 return self.select_compare(target, comparison, left, right)
 
             case ast.UnaryOp(ast.Not(), atom):
-                source = self.select_arg(atom)
-                flip = Instr("xorq", [Immediate(1), target])
-                if source == target:
-                    return [flip]
-                return [Instr("movq", [source, target]), flip]
+                return self.select_compare(target, ast.Eq(), atom, ast.Constant(0))
 
             case ast.UnaryOp(ast.USub(), value):
                 return [
