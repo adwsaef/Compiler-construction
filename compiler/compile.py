@@ -4,6 +4,7 @@ import ast
 import argparse
 import sys
 from collections import deque
+from copy import replace
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
@@ -47,226 +48,148 @@ class Compiler:
 
     def shrink_exp(self, e: expr) -> expr:
         match e:
-            case ast.BoolOp(ast.And(), values):
-                values = [
-                    self.shrink_exp(value)
-                    for value in values
-                ]
+            case ast.BoolOp((ast.And() | ast.Or()) as op, values):
+                values = [self.shrink_exp(value) for value in values]
                 result = values[-1]
                 for value in reversed(values[:-1]):
-                    result = ast.IfExp(value, result, ast.Constant(False))
+                    if isinstance(op, ast.And):
+                        result = ast.IfExp(value, result, ast.Constant(False))
+                    else:
+                        result = ast.IfExp(value, ast.Constant(True), result)
                 return result
-            case ast.BoolOp(ast.Or(), values):
-                values = [
-                    self.shrink_exp(value)
-                    for value in values
-                ]
-                result = values[-1]
-                for value in reversed(values[:-1]):
-                    result = ast.IfExp(value, ast.Constant(True), result)
-                return result
-            case ast.UnaryOp(ast.Not(), operand):
-                return ast.UnaryOp(ast.Not(), self.shrink_exp(operand))
-            case ast.UnaryOp(ast.USub(), operand):
-                return ast.UnaryOp(ast.USub(), self.shrink_exp(operand))
-            case ast.BinOp(
-                left,
-                (ast.Add() | ast.Sub() | ast.Mult()) as operator,
-                right,
-            ):
-                return ast.BinOp(
-                    self.shrink_exp(left),
-                    operator,
-                    self.shrink_exp(right),
-                )
-            case ast.Compare(left, [operator], [right]):
-                return ast.Compare(
-                    self.shrink_exp(left),
-                    [operator],
-                    [self.shrink_exp(right)],
-                )
+            case ast.UnaryOp(ast.Not() | ast.USub(), operand):
+                return replace(e, operand=self.shrink_exp(operand))
+            case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
+                return replace(e, left=self.shrink_exp(left), right=self.shrink_exp(right))
+            case ast.Compare(left, [_], [right]):
+                return replace(e, left=self.shrink_exp(left), comparators=[self.shrink_exp(right)])
             case ast.IfExp(test, body, orelse):
-                return ast.IfExp(
-                    self.shrink_exp(test),
-                    self.shrink_exp(body),
-                    self.shrink_exp(orelse),
+                return replace(
+                    e,
+                    test=self.shrink_exp(test),
+                    body=self.shrink_exp(body),
+                    orelse=self.shrink_exp(orelse),
                 )
             case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
                 return e
             case _:
                 raise Exception(f"Unexpected expression during shrink: {e}")
 
-    def shrink_stmt(self, s: stmt) -> list[stmt]:
+    def shrink_stmt(self, s: stmt) -> stmt:
         match s:
-            case ast.Expr(ast.Call(ast.Name("print"), [value])):
-                return [ast.Expr(ast.Call(ast.Name("print"), [self.shrink_exp(value)]))]
-            case ast.Assign([ast.Name(name)], value):
-                return [ast.Assign([ast.Name(name)], self.shrink_exp(value))]
+            case ast.Expr(ast.Call(ast.Name("print"), [value]) as call):
+                return replace(s, value=replace(call, args=[self.shrink_exp(value)], keywords=[]))
+            case ast.Assign([ast.Name()], value):
+                return replace(s, value=self.shrink_exp(value))
             case ast.While(orelse=orelse) if orelse:
                 raise ValueError("while ... else is not supported")
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
-                shrinked_test = self.shrink_exp(test)
-                shrinked_body = [
-                    shrunk_stmt
-                    for stmt in body
-                    for shrunk_stmt in self.shrink_stmt(stmt)
-                ]
-                shrinked_orelse = [
-                    shrunk_stmt
-                    for stmt in orelse
-                    for shrunk_stmt in self.shrink_stmt(stmt)
-                ]
-                if isinstance(s, ast.If):
-                    return [ast.If(shrinked_test, shrinked_body, shrinked_orelse)]
-                return [ast.While(shrinked_test, shrinked_body, shrinked_orelse)]
+                return replace(
+                    s,
+                    test=self.shrink_exp(test),
+                    body=self.shrink_stmts(body),
+                    orelse=self.shrink_stmts(orelse),
+                )
             case _:
                 raise Exception(f"Unexpected statement during shrink: {s}")
 
+    def shrink_stmts(self, statements: list[stmt]) -> list[stmt]:
+        return [self.shrink_stmt(statement) for statement in statements]
 
     def shrink(self, p: Module) -> Module:
-        statements: list[stmt] = []
-        for statement in p.body:
-            statements.extend(self.shrink_stmt(statement))
-        return ast.Module(statements)
+        return ast.Module(self.shrink_stmts(p.body))
 
     ############################################################################
     # Remove Complex Operands
     ############################################################################
 
+    def temporary_assignments(self, temporaries: Temporaries) -> list[stmt]:
+        return [
+            ast.Assign([name], initializer)
+            for name, initializer in temporaries
+        ]
+
     def make_begin(self, temporaries: Temporaries, result: expr) -> expr:
         if not temporaries:
             return result
 
-        return Begin(
-            [
-                ast.Assign([temporary_name], temporary_value)
-                for temporary_name, temporary_value in temporaries
-            ],
-            result,
-        )
+        return Begin(self.temporary_assignments(temporaries), result)
 
-    def rco_exp(self, e: expr, need_atomic : bool) -> tuple[expr, Temporaries]:
+    def rco_exp(self, e: expr, need_atomic: bool) -> tuple[expr, Temporaries]:
+        result: expr
         match e:
             case ast.Constant() | ast.Name():
                 return e, []
 
             case ast.Call(ast.Name("input_int"), []):
-                if not need_atomic:
-                    return e, []
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, [(temporary, e)]
-
-            case ast.UnaryOp(ast.Not(), operand):
-                rco_operand, temporaries = self.rco_exp(
-                    operand,
-                    need_atomic=not isinstance(operand, ast.Compare),
-                )
-                result = ast.UnaryOp(ast.Not(), rco_operand)
-
-                if not need_atomic:
-                    return result, temporaries
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, temporaries + [(temporary, result)]
+                result = e
+                temporaries: Temporaries = []
 
             case ast.UnaryOp(operator, operand):
-                atomic_operand, temporaries = self.rco_exp(operand, True)
-                result = ast.UnaryOp(operator, atomic_operand)
-
-                if not need_atomic:
-                    return result, temporaries
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, temporaries + [(temporary, result)]
+                keep_comparison = isinstance(operator, ast.Not) and isinstance(operand, ast.Compare)
+                rco_operand, temporaries = self.rco_exp(
+                    operand, need_atomic=not keep_comparison,
+                )
+                result = ast.UnaryOp(operator, rco_operand)
 
             case ast.BinOp(left, operator, right):
                 atomic_left, left_temporaries = self.rco_exp(left, True)
                 atomic_right, right_temporaries = self.rco_exp(right, True)
-                binop = ast.BinOp(atomic_left, operator, atomic_right)
-
-                if not need_atomic:
-                    return binop, left_temporaries + right_temporaries
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, left_temporaries + right_temporaries + [(temporary, binop)]
+                result = ast.BinOp(atomic_left, operator, atomic_right)
+                temporaries = left_temporaries + right_temporaries
 
             case ast.Compare(left, [operator], [right]):
                 atomic_left, left_temporaries = self.rco_exp(left, True)
                 atomic_right, right_temporaries = self.rco_exp(right, True)
-                comparison = ast.Compare(
-                    atomic_left,
-                    [operator],
-                    [atomic_right],
-                )
+                result = ast.Compare(atomic_left, [operator], [atomic_right])
                 temporaries = left_temporaries + right_temporaries
 
-                if not need_atomic:
-                    return comparison, temporaries
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, temporaries + [(temporary, comparison)]
-
             case ast.IfExp(test, body, orelse):
-                rco_test, test_temporaries = self.rco_exp(test, False)
+                rco_test, temporaries = self.rco_exp(test, False)
                 rco_body, body_temporaries = self.rco_exp(body, False)
                 rco_orelse, orelse_temporaries = self.rco_exp(orelse, False)
-                conditional = ast.IfExp(
+                result = ast.IfExp(
                     rco_test,
                     self.make_begin(body_temporaries, rco_body),
                     self.make_begin(orelse_temporaries, rco_orelse),
                 )
-
-                if not need_atomic:
-                    return conditional, test_temporaries
-
-                temporary = ast.Name(generate_name("tmp"))
-                return temporary, test_temporaries + [(temporary, conditional)]
             case _:
                 raise Exception(f"Unexpected expression during RCO: {e}")
+
+        if not need_atomic:
+            return result, temporaries
+        temporary = ast.Name(generate_name("tmp"))
+        temporaries.append((temporary, result))
+        return temporary, temporaries
 
     def rco_stmt(self, s: stmt) -> list[stmt]:
         match s:
             case ast.Expr(ast.Call(ast.Name("print"), [value])):
                 atom, temporaries = self.rco_exp(value, True)
-                statements: list[stmt] = [
-                    ast.Assign([name], temporary)
-                    for name, temporary in temporaries
-                ]
-                statements.append(ast.Expr(ast.Call(ast.Name("print"), [atom])))
-                return statements
-            case ast.Assign([ast.Name(name)], value):
+                return self.temporary_assignments(temporaries) + [ast.Expr(ast.Call(ast.Name("print"), [atom]))]
+            case ast.Assign([ast.Name()], value):
                 expression, temporaries = self.rco_exp(value, False)
-                statements = [
-                    ast.Assign([temporary_name], temporary_value)
-                    for temporary_name, temporary_value in temporaries
-                ]
-                statements.append(ast.Assign([ast.Name(name)], expression))
-                return statements
+                return self.temporary_assignments(temporaries) + [replace(s, value=expression)]
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 expression, temporaries = self.rco_exp(test, False)
                 rco_test = self.make_begin(temporaries, expression)
-                rco_body = [
-                    rco_statement
-                    for statement in body
-                    for rco_statement in self.rco_stmt(statement)
-                ]
-                rco_orelse = [
-                    rco_statement
-                    for statement in orelse
-                    for rco_statement in self.rco_stmt(statement)
-                ]
+                rco_body = self.rco_stmts(body)
+                rco_orelse = self.rco_stmts(orelse)
                 if isinstance(s, ast.If):
                     return [ast.If(rco_test, rco_body, rco_orelse)]
                 return [ast.While(rco_test, rco_body, rco_orelse)]
             case _:
                 raise Exception(f"Unexpected statement during RCO: {s}")
 
+    def rco_stmts(self, statements: list[stmt]) -> list[stmt]:
+        return [
+            rco_statement
+            for statement in statements
+            for rco_statement in self.rco_stmt(statement)
+        ]
+
     def remove_complex_operands(self, p: Module) -> Module:
-        statements: list[stmt] = []
-        for statement in p.body:
-            statements.extend(self.rco_stmt(statement))
-        return ast.Module(statements)
+        return ast.Module(self.rco_stmts(p.body))
 
     ############################################################################
     # ANF Check
@@ -304,9 +227,7 @@ class Compiler:
 
     def is_anf_stmt(self, s: stmt) -> bool:
         match s:
-            case ast.Expr(value):
-                return self.is_anf_exp(value)
-            case ast.Assign(_, value):
+            case ast.Expr(value) | ast.Assign(_, value):
                 return self.is_anf_exp(value)
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
                 return (
@@ -318,10 +239,7 @@ class Compiler:
                 return False
 
     def is_anf(self, p: Module) -> bool:
-        for statement in p.body:
-            if not self.is_anf_stmt(statement):
-                return False
-        return True
+        return all(self.is_anf_stmt(statement) for statement in p.body)
 
     ############################################################################
     # Explicate Control
@@ -558,20 +476,84 @@ class Compiler:
                 raise Exception(f"Unsupported comparison: {comparison}")
 
     def select_compare(
-        self, var: expr, comparison: ast.cmpop, left: expr, right: expr
+        self, target: arg, comparison: ast.cmpop, left: expr, right: expr
     ) -> list[instr]:
         left_arg = self.select_arg(left)
         right_arg = self.select_arg(right)
         match left_arg, right_arg:
             case Immediate(left_value), Immediate(right_value):
                 value = self.compare_constants(comparison, left_value, right_value)
-                return [Instr("movq", [Immediate(int(value)), self.select_arg(var)])]
+                return [Instr("movq", [Immediate(int(value)), target])]
         al = ByteReg("al")
         return [
             Instr("cmpq", [right_arg, left_arg]),
             Instr("set" + self.select_jmp(comparison), [al]),
-            Instr("movzbq", [al, self.select_arg(var)]),
+            Instr("movzbq", [al, target]),
         ]
+
+    def select_assign(self, target: arg, rhs: expr) -> list[instr]:
+        match rhs:
+            case ast.Constant() | ast.Name():
+                return [Instr("movq", [self.select_arg(rhs), target])]
+
+            case ast.Call(ast.Name("input_int"), []):
+                return [Callq("input_int", 0), Instr("movq", [SCRATCH_REGISTER, target])]
+
+            case ast.UnaryOp(ast.Not(), ast.Compare(left, [comparison], [right])):
+                return self.select_compare(target, self.negate_comparison(comparison), left, right)
+
+            case ast.Compare(left, [comparison], [right]):
+                return self.select_compare(target, comparison, left, right)
+
+            case ast.UnaryOp(ast.Not(), atom):
+                source = self.select_arg(atom)
+                flip = Instr("xorq", [Immediate(1), target])
+                if source == target:
+                    return [flip]
+                return [Instr("movq", [source, target]), flip]
+
+            case ast.UnaryOp(ast.USub(), value):
+                return [
+                    Instr("movq", [self.select_arg(value), target]),
+                    Instr("negq", [target]),
+                ]
+
+            case ast.BinOp(left, ast.Add(), right):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if left_arg == target:
+                    return [Instr("addq", [right_arg, target])]
+                if right_arg == target:
+                    return [Instr("addq", [left_arg, target])]
+                return [Instr("movq", [left_arg, target]), Instr("addq", [right_arg, target])]
+
+            case ast.BinOp(left, ast.Sub(), right):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if left_arg == target:
+                    return [Instr("subq", [right_arg, target])]
+                if right_arg == target:
+                    return [Instr("negq", [target]), Instr("addq", [left_arg, target])]
+                return [Instr("movq", [left_arg, target]), Instr("subq", [right_arg, target])]
+
+            case ast.BinOp(left, ast.Mult(), right):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if isinstance(left_arg, Immediate) and isinstance(right_arg, Immediate):
+                    product = left_arg.value * right_arg.value
+                    self.immediate_size(product)
+                    return [Instr("movq", [Immediate(product), target])]
+
+                if isinstance(right_arg, Immediate):
+                    left_arg, right_arg = right_arg, left_arg
+
+                return [
+                    Instr("movq", [left_arg, SCRATCH_REGISTER]),
+                    Instr("imulq", [right_arg, SCRATCH_REGISTER]),
+                    Instr("movq", [SCRATCH_REGISTER, target]),
+                ]
+            case _:
+                raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
 
     def select_stmt(self, s: stmt) -> list[instr]:
         match s:
@@ -608,102 +590,19 @@ class Compiler:
                 ]
 
             case ast.Assign(targets=[ast.Name(lhs)], value=rhs):
-                match rhs:
-                    case ast.Constant() | ast.Name():
-                        return [Instr("movq", [self.select_arg(rhs), Variable(lhs)])]
-
-                    case ast.Call(ast.Name("input_int"), []):
-                        return [
-                            Callq("input_int", 0),
-                            Instr("movq", [Reg("rax"), Variable(lhs)]),
-                        ]
-
-                    case ast.UnaryOp(ast.Not(), ast.Compare(left, [comparison], [right])):
-                        return self.select_compare(
-                            ast.Name(lhs),
-                            self.negate_comparison(comparison),
-                            left,
-                            right,
-                        )
-
-                    case ast.Compare(left, [comparison], [right]):
-                        return self.select_compare(
-                            ast.Name(lhs), comparison, left, right
-                        )
-
-                    case ast.UnaryOp(ast.Not(), atom):
-                        source = self.select_arg(atom)
-                        target = Variable(lhs)
-                        flip = Instr("xorq", [Immediate(1), target])
-                        if source == target:
-                            return [flip]
-                        return [Instr("movq", [source, target]), flip]
-
-                    case ast.UnaryOp(ast.USub(), value):
-                        return [
-                            Instr("movq", [self.select_arg(value), Variable(lhs)]),
-                            Instr("negq", [Variable(lhs)]),
-                        ]
-                    case ast.BinOp(left, ast.Add(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-                        elif type(right) is ast.Name and right.id == lhs:
-                            return [
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("addq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-                    case ast.BinOp(left, ast.Sub(), right):
-                        if type(left) is ast.Name and left.id == lhs:
-                            return [
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-                        elif type(right) is ast.Name and right.id == lhs:
-                            return [
-                                Instr("negq", [Variable(lhs)]),
-                                Instr("addq", [self.select_arg(left), Variable(lhs)]),
-                            ]
-                        else:
-                            return [
-                                Instr("movq", [self.select_arg(left), Variable(lhs)]),
-                                Instr("subq", [self.select_arg(right), Variable(lhs)]),
-                            ]
-                    case ast.BinOp(left, ast.Mult(), right):
-                        left_arg = self.select_arg(left)
-                        right_arg = self.select_arg(right)
-                        if isinstance(left_arg, Immediate) and isinstance(right_arg, Immediate):
-                            product = left_arg.value * right_arg.value
-                            self.immediate_size(product)
-                            return [
-                                Instr("movq", [Immediate(product), Variable(lhs)])
-                            ]
-
-                        if isinstance(right_arg, Immediate):
-                            left_arg, right_arg = right_arg, left_arg
-
-                        # Right arg is not immadiete, emitted imulq is correct.
-                        return [
-                            Instr("movq", [left_arg, SCRATCH_REGISTER]),
-                            Instr("imulq", [right_arg, SCRATCH_REGISTER]),
-                            Instr("movq", [SCRATCH_REGISTER, Variable(lhs)]),
-                        ]
-                    case _:
-                        raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
+                return self.select_assign(Variable(lhs), rhs)
             case _:
                 raise Exception(f"Unexpected statement {s}, it must be assignment or print")
 
     def select_instructions(self, p: CProgram) -> X86Program:
-        blocks: dict[str, list[instr]] = {}
-        for label, statements in p.body.items():
-            instructions: list[instr] = []
-            for statement in statements:
-                instructions.extend(self.select_stmt(statement))
-            blocks[label] = instructions
+        blocks = {
+            label: [
+                instruction
+                for statement in statements
+                for instruction in self.select_stmt(statement)
+            ]
+            for label, statements in p.body.items()
+        }
         return X86Program(blocks)
 
 
