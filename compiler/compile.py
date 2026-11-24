@@ -13,7 +13,7 @@ from cfun import CFunDef, CFunProgram, FunDef, FunProgram  # type: ignore[import
 from cif import BasicBlocks, Begin, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
 from x86_ast import (X86Def, X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
-from x86_interp import NOT_MODELLED, RUNTIME, checkpoint, add_arguments, interp_x86, to_signed # type: ignore[import-untyped]
+from x86_interp import checkpoint, add_arguments, interp_x86, to_signed # type: ignore[import-untyped]
 
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
@@ -66,12 +66,6 @@ BUILTINS = {
     "input_int": Signature({}, INT_TYPE),
     "print": Signature({"value": SCALAR_TYPES}, NO_TYPES),
 }
-
-
-def function_label(name: str) -> str:
-    if name in RUNTIME or name in NOT_MODELLED:
-        return f"fun.{name}"
-    return name
 
 
 class Compiler:
@@ -354,12 +348,11 @@ class Compiler:
                 raise Exception(f"Unexpected statement during shrink: {s}")
 
     def shrink_stmts(self, statements: list[stmt]) -> list[stmt]:
-        shrunk_statements: list[stmt] = []
-        for statement in statements:
-            shrunk = self.shrink_stmt(statement)
-            if shrunk is not None:
-                shrunk_statements.append(shrunk)
-        return shrunk_statements
+        return [
+            shrunk
+            for statement in statements
+            if (shrunk := self.shrink_stmt(statement)) is not None
+        ]
 
     def shrink_def(self, definition: ast.FunctionDef) -> FunDef:
         params = [arg.arg for arg in definition.args.args]
@@ -385,7 +378,6 @@ class Compiler:
         return Begin(self.temporary_assignments(temporaries), result)
 
     def rco_exp(self, e: expr, need_atomic: bool) -> tuple[expr, Temporaries]:
-
         result: expr
         match e:
             case ast.Constant() | ast.Name():
@@ -475,11 +467,7 @@ class Compiler:
     ############################################################################
 
     def is_atom(self, e: expr) -> bool:
-        match e:
-            case ast.Name() | ast.Constant(int()):
-                return True
-            case _:
-                return False
+        return isinstance(e, (ast.Name, ast.Constant))
 
     def is_anf_exp(self, e: expr) -> bool:
         match e:
@@ -795,20 +783,20 @@ class Compiler:
             Instr("movzbq", [al, target]),
         ]
 
-    def select_call(self, name: str, arguments: list[expr]) -> list[instr]:
-        match name:
-            case "print":
-                label = "print_int"
-            case "input_int":
-                label = name
-            case _:
-                label = function_label(name)
+    @staticmethod
+    def function_label(name: str) -> str:
+        if name == "print":
+            return "print_int"
+        if name in ("main", "input_int"):
+            return name
+        return f"fun.{name}"
 
+    def select_call(self, name: str, arguments: list[expr]) -> list[instr]:
         instructions: list[instr] = [
             Instr("movq", [self.select_arg(argument), register])
             for argument, register in zip(arguments, ARGUMENT_REGISTERS)
         ]
-        instructions.append(Callq(label, len(arguments)))
+        instructions.append(Callq(self.function_label(name), len(arguments)))
         return instructions
 
     def select_large_return_addend(self, left: arg, addend: int) -> list[instr]:
@@ -838,7 +826,11 @@ class Compiler:
                 return self.select_compare(target, comparison, left, right)
 
             case ast.UnaryOp(ast.Not(), atom):
-                return self.select_compare(target, ast.Eq(), atom, ast.Constant(0))
+                source = self.select_arg(atom)
+                flip = Instr("xorq", [Immediate(1), target])
+                if source == target:
+                    return [flip]
+                return [Instr("movq", [source, target]), flip]
 
             case ast.UnaryOp(ast.USub(), value):
                 return [
@@ -923,7 +915,7 @@ class Compiler:
     def select_instructions(self, p: CFunProgram) -> list[X86Def]:
         definitions: list[X86Def] = []
         for definition in p.defs:
-            name = function_label(definition.name)
+            name = self.function_label(definition.name)
             conclusion = f"{name}.conclusion"
             blocks: dict[str, list[instr]] = {
                 (name if label == definition.name else label): [
