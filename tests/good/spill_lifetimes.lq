@@ -1,6 +1,6 @@
-x = input_int()
-unused = input_int()
+x: int = input_int()
+unused: int = input_int()
 print(x)
-a = 5
-b = 6
+a: int = 5
+b: int = 6
 print(a + b)

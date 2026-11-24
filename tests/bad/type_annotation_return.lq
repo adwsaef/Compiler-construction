@@ -1,0 +1,6 @@
+def choose(flag: bool) -> int:
+    if flag:
+        return 1
+    return False
+
+print(choose(input_int() > 0))

@@ -1,4 +1,4 @@
-x = 7
+x: int = 7
 print(x)
 x = x + 4
 print(x)

@@ -21,6 +21,8 @@ import ast
 import sys
 from typing import Callable, TextIO
 
+from ast_utils import to_signed
+from cfun import CFunProgram, FunProgram
 from cif import CProgram
 from x86_ast import (
     ByteReg, Callq, Deref, Global, Immediate, IndirectCallq, IndirectJump,
@@ -85,10 +87,6 @@ class InterpError(Exception):
     """Anything the interpreter refuses to do, with a reason."""
 
 
-def to_signed(x: int) -> int:
-    return ((x + (1 << 63)) & MASK64) - (1 << 63)
-
-
 def sign(x: int) -> str:
     return 'e' if x == 0 else ('l' if x < 0 else 'g')
 
@@ -140,6 +138,7 @@ UNARY: dict[str, tuple[Callable[[int], int], bool]] = {
 
 
 Program = X86Program | X86Def | list
+IntermediateProgram = ast.Module | CProgram | FunProgram | CFunProgram
 
 
 def blocks_of(prog: Program) -> dict[str, list[instr]]:
@@ -184,9 +183,8 @@ def frame_size(code: list[instr]) -> int:
 def default_entry(blocks: dict[str, list[instr]]) -> str:
     """Where to start, when the caller has not said.
 
-    Before prelude_and_conclusion there is no `main` block -- the program's
-    own statements are in `main_start` -- so which one exists tells us how far
-    down the pipeline this program is.
+    Function programs use `main` at every x86 stage. Standalone pseudo-x86
+    programs may still name their entry block `main_start`.
     """
     for candidate in ('main', 'main_start'):
         if candidate in blocks:
@@ -226,13 +224,8 @@ def load(blocks: dict[str, list[instr]], entry: str = 'main'
                 undefined.append(label)
             case Callq(func, _) if func not in RUNTIME \
                     and func not in NOT_MODELLED:
-                # Before prelude_and_conclusion a function has no entry
-                # block: calls name `f` while only `f_start` exists.  But a
-                # call to something that is neither is an error here rather
-                # than a jump to nowhere at run time.
-                if func in labels or func + '_start' in labels:
-                    continue
-                undefined.append(func)
+                if func not in labels:
+                    undefined.append(func)
 
     if undefined:
         message = ('undefined label(s): ' + ', '.join(sorted(set(undefined)))
@@ -540,7 +533,7 @@ class Machine:
             self.clobber_caller_saved(also_rax=True)
             self.write(Reg('rax'), value)              # ... and then returns it
             return None
-        target = self.labels.get(func, self.labels.get(func + '_start'))
+        target = self.labels.get(func)
         if target is None:
             raise self.fail(
                 f'callq {func}: no such function.\n'
@@ -559,17 +552,18 @@ class Machine:
         """
         self.push(self.regs['rbp'])
         self.regs['rbp'] = self.regs['rsp']
+        self.regs['rsp'] = to_signed(self.regs['rsp'] - self.frame_size)
         for name in CALLEE_SAVED:
             self.push(self.regs[name])
-        self.regs['rsp'] = to_signed(self.regs['rsp'] - self.frame_size)
         self.synthetic_frames += 1
 
     def tear_down_frame(self) -> None:
         """The conclusion's half: undo build_frame, in reverse."""
         self.regs['rsp'] = to_signed(
-            self.regs['rbp'] - WORD * len(CALLEE_SAVED))
+            self.regs['rbp'] - self.frame_size - WORD * len(CALLEE_SAVED))
         for name in reversed(CALLEE_SAVED):
             self.regs[name] = self.pop()
+        self.regs['rsp'] = self.regs['rbp']
         self.regs['rbp'] = self.pop()
         self.synthetic_frames -= 1
 
@@ -789,26 +783,33 @@ class Machine:
 
 def run(blocks: dict[str, list[instr]], entry: str | None = None, *,
         stdin: TextIO | None = None, stdout: TextIO | None = None,
-        max_steps: int = 10_000_000, heap_size: int = 1 << 20) -> list[int]:
+        max_steps: int = 10_000_000, heap_size: int = 1 << 20,
+        check_frames: bool | None = None) -> list[int]:
     """Interpret a block dictionary, returning the integers it printed."""
     if entry is None:
         entry = default_entry(blocks)
     code, labels, where = load(blocks, entry)
     machine = Machine(code, labels, where, entry,
                       stdin=stdin, stdout=stdout, heap_size=heap_size,
-                      check_frames='main' in blocks)
+                      check_frames=('main' in blocks if check_frames is None else check_frames))
+    if not machine.check_frames:
+        machine.build_frame()
     return machine.run(max_steps)
 
 
-def interp_x86(prog: Program | ast.Module | CProgram, **kwargs) -> list[int] | None:
-    """Print the program, and interpret it when it is x86."""
+def interp_x86(prog: Program | IntermediateProgram, **kwargs) -> list[int] | None:
+    """Execute x86 instructions or display an earlier intermediate form."""
     match prog:
-        case ast.Module() | CProgram():
+        case ast.Module():
+            print(ast.unparse(prog))
+            return None
+        case CProgram() | FunProgram() | CFunProgram():
             print(prog)
             return None
         case _:
-            print(prog, file=sys.stderr)
-            return run(blocks_of(prog), **kwargs)
+            output = '\n'.join(map(str, prog)) if isinstance(prog, list) else prog
+            print(output, file=sys.stderr)
+            return run(blocks_of(prog), check_frames=isinstance(prog, X86Program), **kwargs)
 
 
 # ------------------------------------------------- driver-side conveniences
@@ -817,7 +818,7 @@ def interp_x86(prog: Program | ast.Module | CProgram, **kwargs) -> list[int] | N
 # finished program, and a --interp-after PASS that runs an intermediate one.
 # They live here so that there is one implementation rather than five.
 
-PASSES = ['shrink', 'remove_complex_operands', 'explicate_control', 'select_instructions', 'allocate_registers',
+PASSES = ['type_check', 'shrink', 'remove_complex_operands', 'explicate_control', 'select_instructions', 'allocate_registers',
           'patch_instructions', 'prelude_and_conclusion']
 
 
@@ -828,11 +829,11 @@ def add_arguments(parser) -> None:
                              'writing assembly')
     parser.add_argument('--interp-after', metavar='PASS', default=None,
                         choices=PASSES,
-                        help='interpret the program as it stands after PASS, '
+                        help='display the program after PASS and execute it from select_instructions onward, '
                              'then stop: ' + ', '.join(PASSES))
 
 
-def checkpoint(args, pass_name: str, prog: Program | ast.Module | CProgram) -> None:
+def checkpoint(args, pass_name: str, prog: Program | IntermediateProgram) -> None:
     """Interpret and stop, if --interp-after named this pass.
 
     Called after each back-end pass.  Interpreting between passes is what
@@ -841,6 +842,6 @@ def checkpoint(args, pass_name: str, prog: Program | ast.Module | CProgram) -> N
     """
     if getattr(args, 'interp_after', None) != pass_name:
         return
-    print(f'# interpreting after {pass_name}', file=sys.stderr)
+    print(f'# after {pass_name}', file=sys.stderr)
     interp_x86(prog)
     raise SystemExit(0)

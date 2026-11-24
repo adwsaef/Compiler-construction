@@ -1,7 +1,7 @@
-x = input_int()
-a = 5
-b = 6
-c = 7
+x: int = input_int()
+a: int = 5
+b: int = 6
+c: int = 7
 x = a + b + c
 x = -a + b + c
 x = a + b + input_int()

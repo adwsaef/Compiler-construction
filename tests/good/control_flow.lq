@@ -1,6 +1,6 @@
-a = input_int()
-b = input_int()
-score = 0
+a: int = input_int()
+b: int = input_int()
+score: int = 0
 if a > 0 and b > 0:
     score = score + 1
 else:
@@ -24,14 +24,14 @@ if not (a > 0 and b > 0):
     score = score + 512
 else:
     score = score + 1024
-if a and b:
+if a != 0 and b != 0:
     score = score + 2048
 else:
     score = score + 4096
-if 0:
+if False:
     score = score + 8192
 else:
     score = score + 16384
-if 1:
+if True:
     score = score + 32768
 print(score)

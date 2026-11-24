@@ -1,0 +1,4 @@
+def identity(value) -> int:
+    return value
+
+print(identity(1))

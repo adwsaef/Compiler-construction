@@ -1,0 +1,10 @@
+def increment(n):
+    return n + 1
+
+def count(n):
+    while n < 3:
+        n = increment(n)
+    print(n)
+
+result = count(0)
+print(result)

@@ -1,8 +1,8 @@
-a = input_int()
-b = input_int()
-c = input_int()
-d = input_int()
-score = 0
+a: int = input_int()
+b: int = input_int()
+c: int = input_int()
+d: int = input_int()
+score: int = 0
 if (a > 0 and b > 0 and c > 0) or (d > 0 and (a < b or c == 0)):
     score = score + 1
 else:
@@ -12,10 +12,10 @@ if not ((a > 0 and (b > 0 or c > 0)) or (d > 0 and c < 0)):
 else:
     score = score + 8
 
-e = input_int()
-f = input_int()
-g = input_int()
-h = input_int()
+e: int = input_int()
+f: int = input_int()
+g: int = input_int()
+h: int = input_int()
 if ((e < 0 or f < 0) and (g == 0 or h == 0)) or (e > 0 and not (f > 0)):
     score = score + 16
 else:

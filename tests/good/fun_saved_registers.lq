@@ -1,0 +1,12 @@
+def leaf(n: int) -> int:
+    return n + 1
+
+def inner(n: int) -> int:
+    return n + leaf(n)
+
+def outer(a: int, b: int, c: int, d: int, e: int, f: int) -> int:
+    result: int = inner(a)
+    return result + a + b + c + d + e + f
+
+value: int = input_int()
+print(value + outer(1, 2, 3, 4, 5, 6))

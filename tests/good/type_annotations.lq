@@ -1,0 +1,10 @@
+def positive(value: int) -> bool:
+    return value > 0
+
+def identity(value: int) -> int:
+    return value
+
+answer = identity(41)
+answer: int
+flag: bool = positive(answer) or False
+print(answer + 1 if flag else answer)

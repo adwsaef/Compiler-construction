@@ -5,20 +5,21 @@ import argparse
 import sys
 from collections import deque
 from copy import replace
+from dataclasses import dataclass
 
 from ast import (Constant, expr, stmt, Module, Name, IfExp)
 from ast_utils import generate_name  # type: ignore[import-untyped]
-from cif import BasicBlocks, Begin, CProgram, Goto  # type: ignore[import-untyped]
+from cfun import CFunDef, CFunProgram, FunDef, FunProgram  # type: ignore[import-untyped]
+from cif import BasicBlocks, Begin, Goto  # type: ignore[import-untyped]
 from graph import DirectedAdjList, transpose  # type: ignore[import-untyped]
-from x86_ast import (X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
-from x86_interp import checkpoint, add_arguments, interp_x86 # type: ignore[import-untyped]
+from x86_ast import (X86Def, X86Program, instr, arg, Variable, Immediate, Instr, Callq, Reg, ByteReg, Jump, JumpIf, Deref, is_memory_arg) # type: ignore[import-untyped]
+from x86_interp import checkpoint, add_arguments, interp_x86, to_signed # type: ignore[import-untyped]
 
 Binding = tuple[Name, expr]
 Temporaries = list[Binding]
 
 SCRATCH_REGISTER = Reg("rax")
-MAIN_START = "main_start"
-MAIN_CONCLUSION = "main_conclusion"
+COMPARISON_OPERATORS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 ARGUMENT_REGISTERS = (
     Reg("rdi"), Reg("rsi"), Reg("rdx"), Reg("rcx"), Reg("r8"), Reg("r9"),
 )
@@ -40,7 +41,250 @@ REGISTER_TO_COLOR = {register: color for color, register in COLOR_TO_REGISTER.it
 AVAILABLE_REGISTER_COUNT = sum(color >= 0 for color in COLOR_TO_REGISTER)
 
 
+ScalarTypes = frozenset[type[int]]
+TypeEnvironment = dict[str, ScalarTypes]
+INT_TYPE: ScalarTypes = frozenset({int})
+BOOL_TYPE: ScalarTypes = frozenset({bool})
+SCALAR_TYPES = INT_TYPE | BOOL_TYPE
+NO_TYPES: ScalarTypes = frozenset()
+
+
+@dataclass
+class Signature:
+    parameters: dict[str, ScalarTypes]
+    result: ScalarTypes
+
+
+@dataclass
+class TypeScope:
+    functions: dict[str, Signature]
+    variables: TypeEnvironment
+    function_name: str
+
+
+BUILTINS = {
+    "input_int": Signature({}, INT_TYPE),
+    "print": Signature({"value": SCALAR_TYPES}, NO_TYPES),
+}
+
+
 class Compiler:
+    ############################################################################
+    # Split Module
+    ############################################################################
+
+    def split_module(self, p: Module) -> FunProgram[ast.FunctionDef]:
+        definitions: dict[str, ast.FunctionDef] = {}
+        main_body: list[stmt] = []
+        for statement in p.body:
+            match statement:
+                case ast.FunctionDef(name=name):
+                    if name == "main" or name in BUILTINS:
+                        raise ValueError(f"Reserved function name: {name}")
+                    if name in definitions:
+                        raise ValueError(f"Duplicate function definition: {name}")
+                    definitions[name] = statement
+                case ast.Import() | ast.ImportFrom():
+                    pass
+                case _:
+                    main_body.append(statement)
+        main_body.append(ast.Return(ast.Constant(0)))
+        definitions["main"] = ast.FunctionDef(
+            name="main", args=ast.arguments(), body=main_body, returns=ast.Name(id="int"),
+        )
+        return FunProgram(list(definitions.values()))
+
+    ############################################################################
+    # Check Functions
+    ############################################################################
+
+    def function_arity(self, definition: ast.FunctionDef) -> int:
+        name = definition.name
+        if definition.decorator_list or definition.type_params:
+            raise ValueError(f"Decorators and type parameters are not supported: {name}")
+
+        args = definition.args
+        if (
+            args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg
+            or args.defaults or args.kw_defaults
+        ):
+            raise NotImplementedError(f"{name} only supports ordinary parameters without defaults")
+        params = [parameter.arg for parameter in args.args]
+
+        if len(set(params)) != len(params):
+            raise ValueError(f"Duplicate parameter in function: {name}")
+
+        max_parameters = len(ARGUMENT_REGISTERS)
+        if len(params) > max_parameters:
+            raise ValueError(f"{name} supports at most {max_parameters} parameters")
+
+        return len(params)
+
+    def check_function_uses(self, node: ast.AST, arities: dict[str, int]) -> None:
+        match node:
+            case ast.Name(name) | ast.arg(name):
+                if name in arities:
+                    raise TypeError(f"Function name '{name}' cannot be used as a variable")
+            case ast.Call(ast.Name(name), arguments, []):
+                if name not in arities:
+                    raise TypeError(f"Unknown function '{name}'")
+                arity = arities[name]
+                if len(arguments) != arity:
+                    raise TypeError(f"Function '{name}' expects {arity} arguments, got {len(arguments)}")
+                for argument in arguments:
+                    self.check_function_uses(argument, arities)
+            case ast.Call():
+                raise TypeError("Only direct calls with positional arguments are supported")
+            case ast.AnnAssign(target, _, value):
+                self.check_function_uses(target, arities)
+                if value is not None:
+                    self.check_function_uses(value, arities)
+            case _:
+                for child in ast.iter_child_nodes(node):
+                    self.check_function_uses(child, arities)
+
+    def check_functions(self, p: FunProgram[ast.FunctionDef]) -> None:
+        arities = {name: len(sig.parameters) for name, sig in BUILTINS.items()}
+        for definition in p.defs:
+            arities[definition.name] = self.function_arity(definition)
+
+        for definition in p.defs:
+            for parameter in definition.args.args:
+                self.check_function_uses(parameter, arities)
+            for statement in definition.body:
+                self.check_function_uses(statement, arities)
+
+    ############################################################################
+    # Type Check
+    ############################################################################
+
+    def annotation_type(self, annotation: expr | None, location: str) -> ScalarTypes:
+        match annotation:
+            case ast.Name("int"):
+                return INT_TYPE
+            case ast.Name("bool"):
+                return BOOL_TYPE
+            case None:
+                raise TypeError(f"Missing type annotation for {location}")
+            case _:
+                raise TypeError(f"Unsupported type annotation '{annotation}'")
+
+    def variable_type(self, name: str, scope: TypeScope) -> ScalarTypes:
+        declared = scope.variables.get(name)
+        if declared is None:
+            raise TypeError(f"Missing type annotation for variable '{name}'")
+        return declared
+
+    def require_type(
+        self, actual: ScalarTypes, expected: ScalarTypes, location: str,
+    ) -> None:
+        if actual == NO_TYPES:
+            raise TypeError(f"{location} requires a value")
+        if actual - expected:
+            expected_name = " or ".join(sorted(t.__name__ for t in expected))
+            actual_names = " or ".join(sorted(t.__name__ for t in actual))
+            raise TypeError(f"{location} expects {expected_name}, got {actual_names}")
+
+    def type_check_call(self, name: str, arguments: list[expr], scope: TypeScope) -> ScalarTypes:
+        signature = scope.functions[name]
+        for index, (argument, expected) in enumerate(zip(arguments, signature.parameters.values()), 1):
+            received = self.type_check_exp(argument, scope)
+            self.require_type(received, expected, f"Argument {index} of '{name}'")
+        return signature.result
+
+    def type_check_exp(self, e: expr, scope: TypeScope) -> ScalarTypes:
+        match e:
+            case ast.Constant(int() as value):
+                return BOOL_TYPE if isinstance(value, bool) else INT_TYPE
+            case ast.Name(name):
+                return self.variable_type(name, scope)
+            case ast.UnaryOp(ast.Not(), operand):
+                self.require_type(self.type_check_exp(operand, scope), BOOL_TYPE, "Operand of 'not'")
+                return BOOL_TYPE
+            case ast.UnaryOp(ast.USub(), operand):
+                self.require_type(self.type_check_exp(operand, scope), INT_TYPE, "Operand of unary '-'")
+                return INT_TYPE
+            case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
+                for operand in (left, right):
+                    self.require_type(self.type_check_exp(operand, scope), INT_TYPE, "Arithmetic operand")
+                return INT_TYPE
+            case ast.BoolOp(ast.And() | ast.Or(), values):
+                for operand in values:
+                    self.require_type(self.type_check_exp(operand, scope), BOOL_TYPE, "Boolean operand")
+                return BOOL_TYPE
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
+                left_type = self.type_check_exp(left, scope)
+                right_type = self.type_check_exp(right, scope)
+                if isinstance(op, (ast.Eq, ast.NotEq)):
+                    self.require_type(left_type, SCALAR_TYPES, "Left operand of equality comparison")
+                    self.require_type(right_type, left_type, "Right operand of equality comparison")
+                else:
+                    self.require_type(left_type, INT_TYPE, "Left operand of ordering comparison")
+                    self.require_type(right_type, INT_TYPE, "Right operand of ordering comparison")
+                return BOOL_TYPE
+            case ast.IfExp(test, body, orelse):
+                self.require_type(self.type_check_exp(test, scope), BOOL_TYPE, "Condition")
+                body_type = self.type_check_exp(body, scope)
+                else_type = self.type_check_exp(orelse, scope)
+                self.require_type(body_type, SCALAR_TYPES, "Then branch of conditional expression")
+                self.require_type(else_type, body_type, "Else branch of conditional expression")
+                return body_type
+
+            case ast.Call(ast.Name(name), arguments, []):
+                return self.type_check_call(name, arguments, scope)
+            case _:
+                raise TypeError(f"Expected a scalar expression, got {e}")
+
+    def type_check_stmt(self, statement: stmt, scope: TypeScope) -> None:
+        match statement:
+            case ast.AnnAssign(ast.Name(), _, None):
+                pass
+            case ast.Assign([ast.Name(name)], value) | ast.AnnAssign(ast.Name(name), _, ast.expr() as value):
+                declared = self.variable_type(name, scope)
+                self.require_type(self.type_check_exp(value, scope), declared, f"Variable '{name}'")
+            case ast.Expr(ast.Call() as call):
+                self.type_check_exp(call, scope)
+            case ast.Return(ast.expr() as value):
+                expected = scope.functions[scope.function_name].result
+                self.require_type(self.type_check_exp(value, scope), expected, f"Return from '{scope.function_name}'")
+            case ast.If(test, body, orelse) | ast.While(test, body, [] as orelse):
+                self.require_type(self.type_check_exp(test, scope), BOOL_TYPE, "Condition")
+                self.type_check_stmts(body, scope)
+                self.type_check_stmts(orelse, scope)
+            case _:
+                raise TypeError(f"Unexpected statement during type checking: {statement}")
+
+    def type_check_stmts(self, statements: list[stmt], scope: TypeScope) -> None:
+        for statement in statements:
+            self.type_check_stmt(statement, scope)
+
+    def type_check_def(self, name: str, body: list[stmt], signatures: dict[str, Signature]) -> None:
+        signature = signatures[name]
+        variables = signature.parameters.copy()
+        for node in ast.walk(Module(body, [])):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                variable = node.target.id
+                declared = self.annotation_type(node.annotation, f"variable '{variable}'")
+                if variables.setdefault(variable, declared) != declared:
+                    raise TypeError(f"Conflicting type annotations for '{variable}'")
+
+        scope = TypeScope(signatures, variables, name)
+
+        self.type_check_stmts(body, scope)
+
+    def type_check(self, p: FunProgram[ast.FunctionDef]) -> None:
+        signatures = BUILTINS.copy()
+        for definition in p.defs:
+            name = definition.name
+            parameters = {
+                arg.arg: self.annotation_type(arg.annotation, f"parameter '{arg.arg}' in '{name}'")
+                for arg in definition.args.args
+            }
+            result = self.annotation_type(definition.returns, f"return value of '{name}'")
+            signatures[name] = Signature(parameters, result)
+
+        for definition in p.defs:
+            self.type_check_def(definition.name, definition.body, signatures)
 
     ############################################################################
     # Shrink
@@ -49,19 +293,21 @@ class Compiler:
     def shrink_exp(self, e: expr) -> expr:
         match e:
             case ast.BoolOp((ast.And() | ast.Or()) as op, values):
-                values = [self.shrink_exp(value) for value in values]
-                result = values[-1]
+                if len(values) < 2:
+                    raise ValueError("A boolean operation needs at least two operands")
+                result = self.shrink_exp(values[-1])
                 for value in reversed(values[:-1]):
+                    test = self.shrink_exp(value)
                     if isinstance(op, ast.And):
-                        result = ast.IfExp(value, result, ast.Constant(False))
+                        result = ast.IfExp(test, result, ast.Constant(False))
                     else:
-                        result = ast.IfExp(value, ast.Constant(True), result)
+                        result = ast.IfExp(test, ast.Constant(True), result)
                 return result
             case ast.UnaryOp(ast.Not() | ast.USub(), operand):
                 return replace(e, operand=self.shrink_exp(operand))
             case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
                 return replace(e, left=self.shrink_exp(left), right=self.shrink_exp(right))
-            case ast.Compare(left, [_], [right]):
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
                 return replace(e, left=self.shrink_exp(left), comparators=[self.shrink_exp(right)])
             case ast.IfExp(test, body, orelse):
                 return replace(
@@ -70,17 +316,25 @@ class Compiler:
                     body=self.shrink_exp(body),
                     orelse=self.shrink_exp(orelse),
                 )
-            case ast.Constant() | ast.Name() | ast.Call(ast.Name("input_int"), []):
+            case ast.Call(ast.Name(), arguments, []):
+                return replace(e, args=[self.shrink_exp(arg) for arg in arguments])
+            case ast.Name() | ast.Constant():
                 return e
             case _:
                 raise Exception(f"Unexpected expression during shrink: {e}")
 
-    def shrink_stmt(self, s: stmt) -> stmt:
+    def shrink_stmt(self, s: stmt) -> stmt | None:
         match s:
-            case ast.Expr(ast.Call(ast.Name("print"), [value]) as call):
-                return replace(s, value=replace(call, args=[self.shrink_exp(value)], keywords=[]))
-            case ast.Assign([ast.Name()], value):
+            case (
+                ast.Expr(ast.Call() as value)
+                | ast.Assign([ast.Name()], value)
+                | ast.Return(ast.expr() as value)
+            ):
                 return replace(s, value=self.shrink_exp(value))
+            case ast.AnnAssign(ast.Name() as target, _, value):
+                if value is None:
+                    return None
+                return ast.Assign([target], self.shrink_exp(value))
             case ast.While(orelse=orelse) if orelse:
                 raise ValueError("while ... else is not supported")
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
@@ -94,10 +348,18 @@ class Compiler:
                 raise Exception(f"Unexpected statement during shrink: {s}")
 
     def shrink_stmts(self, statements: list[stmt]) -> list[stmt]:
-        return [self.shrink_stmt(statement) for statement in statements]
+        return [
+            shrunk
+            for statement in statements
+            if (shrunk := self.shrink_stmt(statement)) is not None
+        ]
 
-    def shrink(self, p: Module) -> Module:
-        return ast.Module(self.shrink_stmts(p.body))
+    def shrink_def(self, definition: ast.FunctionDef) -> FunDef:
+        params = [arg.arg for arg in definition.args.args]
+        return FunDef(definition.name, params, self.shrink_stmts(definition.body))
+
+    def shrink(self, p: FunProgram[ast.FunctionDef]) -> FunProgram:
+        return FunProgram([self.shrink_def(definition) for definition in p.defs])
 
     ############################################################################
     # Remove Complex Operands
@@ -121,9 +383,14 @@ class Compiler:
             case ast.Constant() | ast.Name():
                 return e, []
 
-            case ast.Call(ast.Name("input_int"), []):
-                result = e
+            case ast.Call(ast.Name() as callee, arguments, []):
+                atomic_arguments: list[expr] = []
                 temporaries: Temporaries = []
+                for argument in arguments:
+                    atom, argument_temporaries = self.rco_exp(argument, True)
+                    atomic_arguments.append(atom)
+                    temporaries.extend(argument_temporaries)
+                result = ast.Call(callee, atomic_arguments, [])
 
             case ast.UnaryOp(operator, operand):
                 keep_comparison = isinstance(operator, ast.Not) and isinstance(operand, ast.Compare)
@@ -164,10 +431,11 @@ class Compiler:
 
     def rco_stmt(self, s: stmt) -> list[stmt]:
         match s:
-            case ast.Expr(ast.Call(ast.Name("print"), [value])):
-                atom, temporaries = self.rco_exp(value, True)
-                return self.temporary_assignments(temporaries) + [ast.Expr(ast.Call(ast.Name("print"), [atom]))]
-            case ast.Assign([ast.Name()], value):
+            case (
+                ast.Return(ast.expr() as value)
+                | ast.Expr(ast.Call() as value)
+                | ast.Assign([ast.Name()], value)
+            ):
                 expression, temporaries = self.rco_exp(value, False)
                 return self.temporary_assignments(temporaries) + [replace(s, value=expression)]
             case ast.If(test, body, orelse) | ast.While(test, body, orelse):
@@ -188,8 +456,11 @@ class Compiler:
             for rco_statement in self.rco_stmt(statement)
         ]
 
-    def remove_complex_operands(self, p: Module) -> Module:
-        return ast.Module(self.rco_stmts(p.body))
+    def remove_complex_operands(self, p: FunProgram) -> FunProgram:
+        return FunProgram([
+            FunDef(definition.name, definition.params, self.rco_stmts(definition.body))
+            for definition in p.defs
+        ])
 
     ############################################################################
     # ANF Check
@@ -200,17 +471,15 @@ class Compiler:
 
     def is_anf_exp(self, e: expr) -> bool:
         match e:
-            case ast.Constant() | ast.Name():
-                return True
-            case ast.BinOp(left, _, right):
+            case ast.BinOp(left, ast.Add() | ast.Sub() | ast.Mult(), right):
                 return self.is_atom(left) and self.is_atom(right)
             case ast.UnaryOp(ast.Not(), ast.Compare() as comparison):
                 return self.is_anf_exp(comparison)
-            case ast.UnaryOp(_, operand):
+            case ast.UnaryOp(ast.Not() | ast.USub(), operand):
                 return self.is_atom(operand)
-            case ast.Compare(left, [_], [right]):
+            case ast.Compare(left, [op], [right]) if isinstance(op, COMPARISON_OPERATORS):
                 return self.is_atom(left) and self.is_atom(right)
-            case ast.Call(_, arguments):
+            case ast.Call(ast.Name(), arguments, []):
                 return all(self.is_atom(argument) for argument in arguments)
             case ast.IfExp(test, body, orelse):
                 return (
@@ -223,13 +492,17 @@ class Compiler:
                     self.is_anf_stmt(statement) for statement in begin.body
                 ) and self.is_anf_exp(begin.result)
             case _:
-                return False
+                return self.is_atom(e)
 
     def is_anf_stmt(self, s: stmt) -> bool:
         match s:
-            case ast.Expr(value) | ast.Assign(_, value):
+            case (
+                ast.Return(ast.expr() as value)
+                | ast.Expr(ast.Call() as value)
+                | ast.Assign([ast.Name()], value)
+            ):
                 return self.is_anf_exp(value)
-            case ast.If(test, body, orelse) | ast.While(test, body, orelse):
+            case ast.If(test, body, orelse) | ast.While(test, body, [] as orelse):
                 return (
                     self.is_anf_exp(test)
                     and all(self.is_anf_stmt(statement) for statement in body)
@@ -238,8 +511,12 @@ class Compiler:
             case _:
                 return False
 
-    def is_anf(self, p: Module) -> bool:
-        return all(self.is_anf_stmt(statement) for statement in p.body)
+    def is_anf(self, p: FunProgram) -> bool:
+        return all(
+            self.is_anf_stmt(statement)
+            for definition in p.defs
+            for statement in definition.body
+        )
 
     ############################################################################
     # Explicate Control
@@ -275,10 +552,12 @@ class Compiler:
         basic_blocks: BasicBlocks,
     ) -> list[stmt]:
         match s:
-            case ast.Expr(ast.Call(ast.Name("print"), [atom]) as call):
-                return self.explicate_effect(call, cont, basic_blocks)
+            case ast.Expr(value):
+                return self.explicate_effect(value, cont, basic_blocks)
             case ast.Assign([lhs], rhs):
                 return self.explicate_assign(rhs, lhs, cont, basic_blocks)
+            case ast.Return(ast.expr() as value):
+                return self.explicate_tail(value, basic_blocks)
             case ast.If(test, body, orelse):
                 goto_cont = self.create_block(cont, basic_blocks)
                 new_body   = self.explicate_stmts(body,   goto_cont, basic_blocks)
@@ -295,6 +574,18 @@ class Compiler:
                 return goto_loop
             case _:
                 raise Exception(f"Unexpected statement during explicate control: {s}")
+
+    def explicate_tail(self, e: expr, basic_blocks: BasicBlocks) -> list[stmt]:
+        match e:
+            case IfExp(test, body, orelse):
+                then_branch = self.explicate_tail(body, basic_blocks)
+                else_branch = self.explicate_tail(orelse, basic_blocks)
+                return self.explicate_pred(test, then_branch, else_branch, basic_blocks)
+            case Begin() as begin:
+                tail = self.explicate_tail(begin.result, basic_blocks)
+                return self.explicate_stmts(begin.body, tail, basic_blocks)
+            case _:
+                return [ast.Return(e)]
 
     def explicate_assign(
         self,
@@ -315,7 +606,7 @@ class Compiler:
             case (
                 ast.Name()
                 | ast.Constant(int() | bool())
-                | ast.Call(ast.Name("input_int"), [], [])
+                | ast.Call(ast.Name(), _, [])
                 | ast.UnaryOp(ast.USub() | ast.Not(), _)
                 | ast.BinOp(_, ast.Add() | ast.Sub() | ast.Mult(), _)
                 | ast.Compare(_, [_], [_])
@@ -382,14 +673,15 @@ class Compiler:
                 return [ast.Assign([temp], cnd)] + self.explicate_pred(temp, thn, els,
                                                             basic_blocks)
 
-    def explicate_control(self, p: Module) -> CProgram:
-        basic_blocks: BasicBlocks = {}
-        basic_blocks[MAIN_START] = self.explicate_stmts(
-            p.body,
-            [ast.Return(ast.Constant(0))],
-            basic_blocks,
-        )
-        return CProgram(basic_blocks)
+    def explicate_control(self, p: FunProgram) -> CFunProgram:
+        definitions: list[CFunDef] = []
+        for definition in p.defs:
+            basic_blocks: BasicBlocks = {}
+            basic_blocks[definition.name] = self.explicate_stmts(
+                definition.body, [ast.Return(ast.Constant(0))], basic_blocks,
+            )
+            definitions.append(CFunDef(definition.name, definition.params, basic_blocks))
+        return CFunProgram(definitions)
 
     ############################################################################
     # Select Instructions
@@ -491,13 +783,41 @@ class Compiler:
             Instr("movzbq", [al, target]),
         ]
 
+    @staticmethod
+    def function_label(name: str) -> str:
+        if name == "print":
+            return "print_int"
+        if name in ("main", "input_int"):
+            return name
+        return f"fun.{name}"
+
+    def select_call(self, name: str, arguments: list[expr]) -> list[instr]:
+        instructions: list[instr] = [
+            Instr("movq", [self.select_arg(argument), register])
+            for argument, register in zip(arguments, ARGUMENT_REGISTERS)
+        ]
+        instructions.append(Callq(self.function_label(name), len(arguments)))
+        return instructions
+
+    def select_large_return_addend(self, left: arg, addend: int) -> list[instr]:
+        # Load the large constant first because the patcher also uses %rax.
+        if isinstance(left, Immediate):
+            return [Instr("movq", [Immediate(to_signed(left.value + addend)), SCRATCH_REGISTER])]
+        return [
+            Instr("movq", [Immediate(addend), SCRATCH_REGISTER]),
+            Instr("addq", [left, SCRATCH_REGISTER]),
+        ]
+
     def select_assign(self, target: arg, rhs: expr) -> list[instr]:
         match rhs:
             case ast.Constant() | ast.Name():
                 return [Instr("movq", [self.select_arg(rhs), target])]
 
-            case ast.Call(ast.Name("input_int"), []):
-                return [Callq("input_int", 0), Instr("movq", [SCRATCH_REGISTER, target])]
+            case ast.Call(ast.Name(name), arguments, []):
+                instructions = self.select_call(name, arguments)
+                if target != SCRATCH_REGISTER:
+                    instructions.append(Instr("movq", [SCRATCH_REGISTER, target]))
+                return instructions
 
             case ast.UnaryOp(ast.Not(), ast.Compare(left, [comparison], [right])):
                 return self.select_compare(target, self.negate_comparison(comparison), left, right)
@@ -521,6 +841,9 @@ class Compiler:
             case ast.BinOp(left, ast.Add(), right):
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
+                if (target == SCRATCH_REGISTER and isinstance(right_arg, Immediate)
+                        and self.immediate_size(right_arg.value) == 64):
+                    return self.select_large_return_addend(left_arg, right_arg.value)
                 if left_arg == target:
                     return [Instr("addq", [right_arg, target])]
                 if right_arg == target:
@@ -530,6 +853,9 @@ class Compiler:
             case ast.BinOp(left, ast.Sub(), right):
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
+                if (target == SCRATCH_REGISTER and isinstance(right_arg, Immediate)
+                        and self.immediate_size(right_arg.value) == 64):
+                    return self.select_large_return_addend(left_arg, to_signed(-right_arg.value))
                 if left_arg == target:
                     return [Instr("subq", [right_arg, target])]
                 if right_arg == target:
@@ -555,18 +881,13 @@ class Compiler:
             case _:
                 raise Exception(f"Unrecognized right-hand side of assignment: {rhs}")
 
-    def select_stmt(self, s: stmt) -> list[instr]:
+    def select_stmt(self, s: stmt, conclusion: str) -> list[instr]:
         match s:
             case Goto(label):
                 return [Jump(label)]
 
-            case ast.Return(value):
-                if value is None:
-                    return [Jump(MAIN_CONCLUSION)]
-                return [
-                    Instr("movq", [self.select_arg(value), SCRATCH_REGISTER]),
-                    Jump(MAIN_CONCLUSION),
-                ]
+            case ast.Return(ast.expr() as value):
+                return self.select_assign(SCRATCH_REGISTER, value) + [Jump(conclusion)]
 
             case ast.If(ast.Compare(left, [comparison], [right]), [Goto(thn)], [Goto(els)]):
                 left_arg = self.select_arg(left)
@@ -583,27 +904,35 @@ class Compiler:
                     Jump(els),
                 ]
 
-            case ast.Expr(ast.Call(ast.Name("print"), [atom])):
-                return [
-                    Instr("movq", [self.select_arg(atom), Reg("rdi")]),
-                    Callq("print_int", 1),
-                ]
+            case ast.Expr(ast.Call(ast.Name(name), arguments, [])):
+                return self.select_call(name, arguments)
 
             case ast.Assign(targets=[ast.Name(lhs)], value=rhs):
                 return self.select_assign(Variable(lhs), rhs)
             case _:
-                raise Exception(f"Unexpected statement {s}, it must be assignment or print")
+                raise Exception(f"Unexpected statement during instruction selection: {s}")
 
-    def select_instructions(self, p: CProgram) -> X86Program:
-        blocks = {
-            label: [
-                instruction
-                for statement in statements
-                for instruction in self.select_stmt(statement)
+    def select_instructions(self, p: CFunProgram) -> list[X86Def]:
+        definitions: list[X86Def] = []
+        for definition in p.defs:
+            name = self.function_label(definition.name)
+            conclusion = f"{name}.conclusion"
+            blocks: dict[str, list[instr]] = {
+                (name if label == definition.name else label): [
+                    instruction
+                    for statement in statements
+                    for instruction in self.select_stmt(statement, conclusion)
+                ]
+                for label, statements in definition.blocks.items()
+            }
+            # Include the incoming moves in liveness so later arguments stay intact.
+            parameter_moves: list[instr] = [
+                Instr("movq", [register, Variable(parameter)])
+                for parameter, register in zip(definition.params, ARGUMENT_REGISTERS)
             ]
-            for label, statements in p.body.items()
-        }
-        return X86Program(blocks)
+            blocks[name] = parameter_moves + blocks[name]
+            definitions.append(X86Def(name, blocks))
+        return definitions
 
 
     ############################################################################
@@ -657,10 +986,9 @@ class Compiler:
             case _:
                 raise ValueError(f"Writes are not defined for {instruction}")
 
-    def control_flow_graph(self, p: X86Program) -> DirectedAdjList:
-        assert isinstance(p.body, dict)
+    def control_flow_graph(self, p: X86Def) -> DirectedAdjList:
         graph = DirectedAdjList()
-        for label, instructions in p.body.items():
+        for label, instructions in p.blocks.items():
             graph.add_vertex(label)
             for instruction in instructions:
                 match instruction:
@@ -668,8 +996,7 @@ class Compiler:
                         graph.add_edge(label, target)
         return graph
 
-    def uncover_live(self, p: X86Program) -> dict[str, list[set[arg]]]:
-        assert isinstance(p.body, dict)
+    def uncover_live(self, p: X86Def) -> dict[str, list[set[arg]]]:
         cfg = self.control_flow_graph(p)
         predecessors = transpose(cfg)
         worklist = deque(cfg.vertices())
@@ -681,7 +1008,7 @@ class Compiler:
         while worklist:
             label = worklist.pop()
             queued.remove(label)
-            instructions = p.body.get(label, [])
+            instructions = p.blocks.get(label, [])
             live: set[arg] = set()
             after_instructions: list[set[arg]] = [set() for _ in instructions]
             for index in reversed(range(len(instructions))):
@@ -725,13 +1052,11 @@ class Compiler:
 
     def build_interference_graph(
         self,
-        p: X86Program,
+        p: X86Def,
         live_after: dict[str, list[set[arg]]],
     ) -> dict[arg, set[arg]]:
-        blocks = p.body
-        assert isinstance(blocks, dict)
         graph: dict[arg, set[arg]] = {}
-        for label, instructions in blocks.items():
+        for label, instructions in p.blocks.items():
             for index, instruction in enumerate(instructions):
                 writes = self.instruction_write(instruction)
                 for location in live_after[label][index] | writes:
@@ -746,15 +1071,12 @@ class Compiler:
 
     def debug_register_allocation(
         self,
-        p: X86Program,
+        p: X86Def,
         live_after: dict[str, list[set[arg]]],
         allocatable_registers: tuple[Reg, ...],
         coloring: dict[arg, int],
         homes: dict[Variable, arg],
     ) -> None:
-        blocks = p.body
-        assert isinstance(blocks, dict)
-
         print(
             "Available for allocation: "
             + ", ".join(map(str, allocatable_registers)),
@@ -762,7 +1084,7 @@ class Compiler:
         )
 
         rows: list[tuple[str, str, str]] = []
-        for label, instructions in blocks.items():
+        for label, instructions in p.blocks.items():
             for index, instruction in enumerate(instructions):
                 after = live_after[label][index]
                 live_text = "{" + ", ".join(sorted(map(str, after))) + "}"
@@ -812,14 +1134,12 @@ class Compiler:
 
     def allocate_registers(
         self,
-        p: X86Program,
+        p: X86Def,
         registers_cap: int = AVAILABLE_REGISTER_COUNT,
         debug_allocate_registers: bool = False,
-    ) -> X86Program:
+    ) -> X86Def:
         if registers_cap < 1:
             raise ValueError("registers_cap must be at least 1")
-        blocks = p.body
-        assert isinstance(blocks, dict)
         live_after = self.uncover_live(p)
         graph = self.build_interference_graph(p, live_after)
 
@@ -848,7 +1168,7 @@ class Compiler:
                 tuple(COLOR_TO_REGISTER[color] for color in range(registers_cap)),
                 coloring, homes,
             )
-        p.body = {
+        blocks: dict[str, list[instr]] = {
             label: [
                 Instr(
                     instruction.instr,
@@ -860,15 +1180,15 @@ class Compiler:
                 if isinstance(instruction, Instr) else instruction
                 for instruction in instructions
             ]
-            for label, instructions in blocks.items()
+            for label, instructions in p.blocks.items()
         }
-        return p
+        return X86Def(p.name, blocks)
 
     ############################################################################
     # Patch Instructions
     ############################################################################
     def patch_instr(self, i: instr) -> list[instr]:
-        # Keep the scratch register out of the allocatable register set.
+        # The scratch register is reserved by the allocator.
         match i:
             case Instr(instr="movq", args=[source, destination]) if source == destination:
                 return []
@@ -898,6 +1218,7 @@ class Compiler:
                             return [i]
                         if i.instr == "movq" and type(destination) is Reg:
                             return [i]
+                        assert destination != SCRATCH_REGISTER, "Patching would overwrite %rax"
                         return [
                             Instr("movq", [Immediate(value), SCRATCH_REGISTER]),
                             Instr(i.instr, [SCRATCH_REGISTER, destination]),
@@ -911,16 +1232,15 @@ class Compiler:
                         ]
         return [i]
 
-    def patch_instructions(self, p: X86Program) -> X86Program:
-        assert isinstance(p.body, dict)
+    def patch_instructions(self, p: X86Def) -> X86Def:
         blocks: dict[str, list[instr]] = {}
-        for label, instructions in p.body.items():
+        for label, instructions in p.blocks.items():
             blocks[label] = [
                 patched
                 for instruction in instructions
                 for patched in self.patch_instr(instruction)
             ]
-        return X86Program(blocks, p.entries)
+        return X86Def(p.name, blocks)
 
     ############################################################################
     # Prelude & Conclusion
@@ -945,10 +1265,8 @@ class Compiler:
             default=0,
         )
 
-    def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        blocks = p.body
-        assert isinstance(blocks, dict)
-        instructions = [i for block in blocks.values() for i in block]
+    def add_function_frame(self, p: X86Def) -> dict[str, list[instr]]:
+        instructions = [i for block in p.blocks.values() for i in block]
         used_stack_bytes = self.used_stack_size(instructions)
 
         used_saved_registers = self.used_callee_saved_registers(instructions)
@@ -980,21 +1298,24 @@ class Compiler:
             Instr("retq", []),
         ])
 
-        p.body = {
-            "main": prologue + [Jump(MAIN_START)],
-            **blocks,
-            MAIN_CONCLUSION: conclusion,
+        return {
+            **p.blocks,
+            p.name: prologue + p.blocks[p.name],
+            f"{p.name}.conclusion": conclusion,
         }
 
-        return p
+    def prelude_and_conclusion(self, definitions: list[X86Def]) -> X86Program:
+        blocks: dict[str, list[instr]] = {}
+        for definition in definitions:
+            blocks.update(self.add_function_frame(definition))
+        return X86Program(blocks, frozenset(d.name for d in definitions))
 
-# TODO: dopisac walidacje typów i czy funkcja zawsze zwraca i zwraca to samo
-# jakis prosty skrpyt generujacy obok kompilatora asm
-# readme dopisać, opisać typecheck tam
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("output", nargs="?")
+    parser.add_argument("--no-type-check", action="store_true", help="skip source type checking")
     parser.add_argument("--debug-allocate-registers", action="store_true", help="print live-after sets, added edges, colors, and homes")
     parser.add_argument(
         "--registers-cap", type=int, default=AVAILABLE_REGISTER_COUNT,
@@ -1007,8 +1328,12 @@ def main():
         module = ast.parse(file.read())
 
     compiler = Compiler()
-
-    shrinked = compiler.shrink(module)
+    program = compiler.split_module(module)
+    compiler.check_functions(program)
+    if not args.no_type_check:
+        compiler.type_check(program)
+    checkpoint(args, "type_check", module)
+    shrinked = compiler.shrink(program)
     checkpoint(args, "shrink", shrinked)
     simplified = compiler.remove_complex_operands(shrinked)
     assert compiler.is_anf(simplified), \
@@ -1018,12 +1343,12 @@ def main():
     checkpoint(args, "explicate_control", explicated)
     instruction_list = compiler.select_instructions(explicated)
     checkpoint(args, "select_instructions", instruction_list)
-    allocated = compiler.allocate_registers(
-        instruction_list, registers_cap=args.registers_cap,
-        debug_allocate_registers=args.debug_allocate_registers,
-    )
+    allocated = [
+        compiler.allocate_registers(definition, args.registers_cap, args.debug_allocate_registers)
+        for definition in instruction_list
+    ]
     checkpoint(args, "allocate_registers", allocated)
-    patched_instructions = compiler.patch_instructions(allocated)
+    patched_instructions = [compiler.patch_instructions(definition) for definition in allocated]
     checkpoint(args, "patch_instructions", patched_instructions)
     added_prelude_conclusion = compiler.prelude_and_conclusion(patched_instructions)
     checkpoint(args, "prelude_and_conclusion", added_prelude_conclusion)

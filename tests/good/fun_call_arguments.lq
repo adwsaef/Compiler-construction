@@ -1,0 +1,16 @@
+def emit(n: int) -> int:
+    print(n)
+    return 0
+
+def mark(n: int, offset: int) -> int:
+    emit(n)
+    digit: int = n + offset
+    return digit
+
+def digits(a: int, b: int, c: int, d: int, e: int, f: int) -> int:
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f
+
+def reverse(a: int, b: int, c: int, d: int, e: int, f: int) -> int:
+    return digits(f, e, d, c, b, a)
+
+print(reverse(mark(0, 1), 2, 3, 4, 5, mark(5, 1)))

@@ -26,6 +26,10 @@ def dedent():
     global indent_amount
     indent_amount -= 2
 
+def to_signed(x: int) -> int:
+    return ((x + (1 << 63)) & ((1 << 64) - 1)) - (1 << 63)
+
+
 def label_name(n: str) -> str:
     if sys.platform == "darwin":
         return '_' + n
@@ -88,6 +92,19 @@ def repr_Module(self):
 
 
 Module.__repr__ = repr_Module
+
+
+def str_FunctionDef(self):
+    header = indent_stmt() + f'def {self.name}({ast.unparse(self.args)})'
+    if self.returns is not None:
+        header += f' -> {ast.unparse(self.returns)}'
+    indent()
+    body = ''.join(str(s) for s in self.body)
+    dedent()
+    return header + ':\n' + body
+
+
+ast.FunctionDef.__str__ = str_FunctionDef
 
 
 def str_Expr(self):

@@ -1,6 +1,6 @@
-v = 1
-w = 42
-x = v + 7
-y = x
-z = x + w
+v: int = 1
+w: int = 42
+x: int = v + 7
+y: int = x
+z: int = x + w
 print(z + (- y))

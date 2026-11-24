@@ -8,7 +8,7 @@ labelled basic blocks.  They are separate classes rather than one reused
 `Begin` and `Goto` still come from cif.py -- explicate_control's output
 language is unchanged apart from being per function.
 """
-from ast import stmt
+from ast import FunctionDef, stmt
 from dataclasses import dataclass, field
 
 from ast_utils import dedent, indent
@@ -32,9 +32,9 @@ class FunDef:
 
 
 @dataclass
-class FunProgram:
+class FunProgram[T: (FunctionDef, FunDef) = FunDef]:
     """A whole program: nothing but function definitions, one named main."""
-    defs: list[FunDef]
+    defs: list[T]
     __match_args__ = ("defs",)
 
     def __str__(self):
